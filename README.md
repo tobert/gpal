@@ -1,48 +1,62 @@
-# gpal - Gemini as an MCP with tools to explore the repo
+# gpal
 
-`gpal` is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that gives
-your IDE or agentic workflow access to Gemini models. It wraps the latest Google Gemini models
-in a stateful, tool-equipped interface designed for deep code analysis.
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io/)
+
+**Gemini Principal Assistant Layer** — an MCP server that gives your IDE or agent access to Google Gemini with autonomous codebase exploration.
+
+## Why gpal?
+
+When you ask gpal a question, Gemini doesn't just guess — it **explores your codebase itself**. It lists directories, reads files, and searches for patterns before answering. This makes it ideal for:
+
+- 🔍 **Deep code analysis** — "Find all error handling patterns in this codebase"
+- 🏗️ **Architectural reviews** — "How is authentication implemented?"
+- 🐛 **Bug hunting** — "Why might this function return null?"
+- 📚 **Codebase onboarding** — "Explain how the request pipeline works"
 
 ## Features
 
-*   **Stateful Consulting:** Maintains conversation history (`session_id`), allowing for iterative debugging and architectural debates.
-*   **High-Agency:** Equipped with internal tools (`list_directory`, `read_file`, `search_project`) to autonomously explore your codebase. When you ask a question, Gemini doesn't just guess; it lists, reads, and searches files itself to gather context.
-*   **Nested Agency:** You can ask your host model (e.g. Claude) to "Ask Gemini to find the bug," and Claude will delegate the entire exploration and analysis task to Gemini.
-*   **Massive Context Window:** Leverages Gemini 3's 2M token context window to ingest entire modules, large files, or extensive documentation sets.
-*   **Multi-Tier Consultation:** Choose between speed and depth:
-    *   `consult_gemini_flash`: **The Scout.** Optimized for exploration, searching, and context gathering. Use this *first* to map the codebase and find the right files.
-    *   `consult_gemini_pro`: **The Architect.** Optimized for deep reasoning and synthesis. Use this *after* Flash has found the relevant context to perform complex audits or architectural reviews.
-    *   **Seamless Switching:** Conversation history is preserved when switching between Flash and Pro for the same `session_id`.
-*   **Open Standard:** Built on MCP, making it compatible with Claude Desktop, Cursor, VS Code, and other MCP clients.
+| Feature | Description |
+|---------|-------------|
+| **Stateful sessions** | Maintains conversation history via `session_id` |
+| **Autonomous exploration** | Gemini has tools to list, read, and search files |
+| **2M token context** | Leverages Gemini 3's massive context window |
+| **Two-tier consultation** | Flash for speed, Pro for depth |
+| **Seamless switching** | History preserved when switching between Flash and Pro |
+| **Nested agency** | Claude can delegate entire tasks to Gemini |
+
+### Flash vs Pro
+
+| Model | Use Case | Strengths |
+|-------|----------|-----------|
+| `consult_gemini_flash` | **Scout** — exploration first | Fast, efficient, great for searching and mapping |
+| `consult_gemini_pro` | **Architect** — analysis second | Deep reasoning, synthesis, complex reviews |
+
+**Workflow:** Start with Flash to gather context, then switch to Pro for analysis. Both share the same session history.
 
 ## Installation
 
 ### Prerequisites
 
-*   Python 3.12+
-*   [`uv`](https://github.com/astral-sh/uv) (Recommended)
-*   Google Gemini API Key (Get one at [AI Studio](https://aistudio.google.com/))
+- Python 3.12+
+- [uv](https://github.com/astral-sh/uv) (recommended)
+- [Gemini API key](https://aistudio.google.com/)
 
-### Running Standalone
+### Quick Start
 
-1.  **Clone the repo:**
-    ```bash
-    git clone https://github.com/tobert/gpal.git
-    cd gpal
-    ```
-
-2.  **Run with `uv`:**
-    ```bash
-    export GEMINI_API_KEY="your_key_here"
-    uv run gpal
-    ```
+```bash
+git clone https://github.com/tobert/gpal.git
+cd gpal
+export GEMINI_API_KEY="your_key_here"  # or GOOGLE_API_KEY
+uv run gpal
+```
 
 ## Usage
 
-### with Claude Desktop
+### Claude Desktop / Cursor / VS Code
 
-Add the following to your `claude_desktop_config.json`:
+Add to your MCP config (e.g., `claude_desktop_config.json`):
 
 ```json
 {
@@ -51,46 +65,44 @@ Add the following to your `claude_desktop_config.json`:
       "command": "bash",
       "args": [
         "-c",
-        "GEMINI_API_KEY=$(< ~/.gpal-api-key) uv --directory /absolute/path/to/gpal run gpal"
+        "GEMINI_API_KEY=$(< ~/.gpal-api-key) uv --directory /path/to/gpal run gpal"
       ]
     }
   }
 }
 ```
 
-Once connected, you will have two new tools: `consult_gemini_flash` and `consult_gemini_pro`.
+Then ask your AI assistant:
 
-**Examples:**
-> *"Ask `consult_gemini_flash` to summarize `src/main.py`."*
-> *"Ask `consult_gemini_pro` to identify potential security vulnerabilities in the `auth` module based on the files in `src/gpal/auth.py`."*
+> "Ask Gemini to analyze the authentication flow in this codebase"
+
+> "Use `consult_gemini_flash` to find where errors are handled"
 
 ### Programmatic Usage
-
-You can use `gpal` as a library in your own Python agents:
 
 ```python
 from gpal.server import consult_gemini_flash, consult_gemini_pro
 
-# Use Flash for quick queries
-flash_response = consult_gemini_flash.fn(
-    "List the top-level files in this directory.", 
-    session_id="dev-session-1"
+# Flash: Quick exploration
+result = consult_gemini_flash.fn(
+    "What files are in the src directory?",
+    session_id="review-1"
 )
-print(f"Flash: {flash_response}")
 
-# Continue the same session with Pro for deeper analysis
-pro_response = consult_gemini_pro.fn(
-    "From the files you just listed, what is the main entry point of the application?", 
-    session_id="dev-session-1"
+# Pro: Deep analysis (same session, history preserved)
+analysis = consult_gemini_pro.fn(
+    "Based on those files, explain the architecture",
+    session_id="review-1"
 )
-print(f"Pro: {pro_response}")
 ```
 
 ## Development
 
-*   **Test:** `uv run pytest`
-*   **Lint:** `uv run ruff check .` (if configured)
+```bash
+uv run pytest              # Run tests
+uv run pytest -v           # Verbose output
+```
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE)

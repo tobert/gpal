@@ -449,8 +449,12 @@ dependencies = [
     { name = "fastmcp" },
     { name = "google-genai" },
     { name = "mcp", extra = ["cli"] },
-    { name = "pytest" },
     { name = "python-dotenv" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "pytest" },
 ]
 
 [package.metadata]
@@ -458,9 +462,10 @@ requires-dist = [
     { name = "fastmcp", specifier = ">=2.14.4" },
     { name = "google-genai", specifier = ">=1.60.0" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.26.0" },
-    { name = "pytest", specifier = ">=9.0.2" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.2" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
 ]
+provides-extras = ["dev"]
 
 [[package]]
 name = "h11"
