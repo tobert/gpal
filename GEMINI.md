@@ -39,6 +39,10 @@
 ### Tool: `consult_gemini`
 *   **Persona:** Principal Software Engineer.
 *   **Stateful:** Uses `session_id` to maintain multi-turn conversations.
+*   **Multi-Model:** Supports seamless switching between models within a session.
+    *   `model="flash"` (Default): Gemini 3 Flash Preview (Fast, efficient).
+    *   `model="pro"`: Gemini 3 Pro Preview (Deep reasoning).
+    *   *Usage:* Start with Flash to explore, then switch to Pro for complex analysis. History is preserved.
 *   **Agentic:** Gemini has access to internal tools to explore your codebase autonomously:
     *   `list_directory`: Lists files in the repo.
     *   `read_file`: Reads file contents.

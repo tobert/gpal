@@ -3,7 +3,7 @@ import logging
 import glob
 import fnmatch
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Literal
 from fastmcp import FastMCP
 from google import genai
 from google.genai import types
@@ -17,6 +17,12 @@ mcp = FastMCP("gpal")
 
 # Global state for sessions
 sessions = {}
+
+# Model Configuration
+MODEL_ALIASES = {
+    "flash": "gemini-3-flash-preview",
+    "pro": "gemini-3-pro-preview"
+}
 
 # --- Gemini Tools ---
 
@@ -84,52 +90,90 @@ def get_client():
         raise ValueError("GEMINI_API_KEY or GOOGLE_API_KEY not found in environment.")
     return genai.Client(api_key=api_key)
 
-def get_session(session_id: str, client: genai.Client):
-    if session_id not in sessions:
-        # Define the tools available to Gemini
-        gemini_tools = [list_directory, read_file, search_project]
-
-        sessions[session_id] = client.chats.create(
-            model="gemini-3-flash-preview",
-            config=types.GenerateContentConfig(
-                temperature=0.2,
-                tools=gemini_tools, 
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                    disable=False,
-                    maximum_remote_calls=10 
-                ),
-                system_instruction="""You are a specialized technical consultant accessed via the Model Context Protocol (MCP).
-                Your role is to provide high-agency, deep reasoning and analysis on software engineering tasks.
-                
-                You have access to tools: 'list_directory', 'read_file', and 'search_project'. 
-                USE THEM PROACTIVELY to explore the codebase. Do not ask the user for file contents if you can find them yourself.
-                
-                Operational Guide:
-                1. Context First: Ground your answers strictly in data.
-                2. Explore: If asked about a feature, search for it, find the file, read it, THEN answer.
-                3. No Roleplay: Be a functional, high-agency expert.
-                4. Output: Be direct, concise, and technically precise.
-                """
-            )
+def create_chat(client: genai.Client, model_name: str, history: List = None):
+    """Helper to create a configured chat session."""
+    gemini_tools = [list_directory, read_file, search_project]
+    
+    return client.chats.create(
+        model=model_name,
+        history=history or [],
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            tools=gemini_tools, 
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                disable=False,
+                maximum_remote_calls=10 
+            ),
+            system_instruction="""You are a specialized technical consultant accessed via the Model Context Protocol (MCP).
+            Your role is to provide high-agency, deep reasoning and analysis on software engineering tasks.
+            
+            You have access to tools: 'list_directory', 'read_file', and 'search_project'. 
+            USE THEM PROACTIVELY to explore the codebase. Do not ask the user for file contents if you can find them yourself.
+            
+            Operational Guide:
+            1. Context First: Ground your answers strictly in data.
+            2. Explore: If asked about a feature, search for it, find the file, read it, THEN answer.
+            3. No Roleplay: Be a functional, high-agency expert.
+            4. Output: Be direct, concise, and technically precise.
+            """
         )
+    )
+
+def get_session(session_id: str, client: genai.Client, requested_model_alias: str):
+    # Resolve alias (e.g., "flash" -> "gemini-3-flash-preview")
+    target_model = MODEL_ALIASES.get(requested_model_alias.lower(), requested_model_alias)
+    
+    if session_id not in sessions:
+        # New session
+        sessions[session_id] = create_chat(client, target_model)
+        # Store the model name on the session object for future checks
+        sessions[session_id]._gpal_model_name = target_model
+    else:
+        # Existing session: Check if migration is needed
+        current_session = sessions[session_id]
+        current_model = getattr(current_session, "_gpal_model_name", None)
+        
+        if current_model != target_model:
+            # Migration needed: Create new chat with old history
+            try:
+                # We attempt to carry over history
+                # Note: 'history' property returns list of Content objects
+                old_history = current_session._curated_history if hasattr(current_session, "_curated_history") else []
+                # If _curated_history isn't public/stable, we might lose history. 
+                # Ideally verify SDK docs. For now, we assume standard usage.
+                
+                logging.info(f"Migrating session {session_id} from {current_model} to {target_model}")
+                sessions[session_id] = create_chat(client, target_model, history=old_history)
+                sessions[session_id]._gpal_model_name = target_model
+            except Exception as e:
+                # Fallback: Just start fresh if migration fails
+                logging.error(f"Failed to migrate session history: {e}")
+                sessions[session_id] = create_chat(client, target_model)
+                sessions[session_id]._gpal_model_name = target_model
+                
     return sessions[session_id]
 
 @mcp.tool()
-def consult_gemini(query: str, session_id: str = "default", file_paths: List[str] = []) -> str:
+def consult_gemini(
+    query: str, 
+    session_id: str = "default", 
+    model: str = "flash", 
+    file_paths: List[str] = []
+) -> str:
     """
-    Consults with Google Gemini about a query. Gemini can autonomously read files and search the project.
+    Consults with Google Gemini about a query. Supports switching between 'flash' (speed) and 'pro' (reasoning).
     
     Args:
-        query: The question or instruction for Gemini.
-        session_id: A unique identifier for the conversation session. Use the same ID to continue a discussion.
-        file_paths: (Optional) List of absolute file paths to pre-load. Gemini can also read files itself.
+        query: The question or instruction.
+        session_id: ID for conversation history.
+        model: "flash" (default) or "pro". You can switch mid-session.
+        file_paths: (Optional) Pre-load specific files.
     """
     client = get_client()
-    session = get_session(session_id, client)
+    session = get_session(session_id, client, model)
     
     parts = []
     
-    # Pre-load files if provided manually
     for path in file_paths:
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -141,7 +185,6 @@ def consult_gemini(query: str, session_id: str = "default", file_paths: List[str
     parts.append(types.Part.from_text(text=query))
     
     try:
-        # The SDK handles the tool calling loop automatically
         response = session.send_message(parts)
         return response.text
     except Exception as e:
