@@ -1,8 +1,8 @@
-# gpal (Gemini Principal Assistant Layer)
+# gpal - Gemini as an MCP with tools to explore the repo
 
-> **Your "Second Brain" for Software Engineering, powered by Gemini 3.**
-
-`gpal` is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that gives your IDE or agentic workflow access to a Principal Software Engineer persona. It wraps the latest Google Gemini models in a stateful, tool-equipped interface designed for deep code analysis.
+`gpal` is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that gives
+your IDE or agentic workflow access to Gemini models. It wraps the latest Google Gemini models
+in a stateful, tool-equipped interface designed for deep code analysis.
 
 ## Features
 
