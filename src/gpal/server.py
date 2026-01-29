@@ -51,11 +51,8 @@ def search_project(search_term: str, glob_pattern: str = "**/*") -> str:
     """
     try:
         matches = []
-        # glob.glob with recursive=True requires root_dir or absolute paths usually,
-        # but here we scan from CWD.
         files = glob.glob(glob_pattern, recursive=True)
         
-        # Limit search to avoid massive scans if pattern is too broad
         if len(files) > 1000:
              return f"Error: Too many files match '{glob_pattern}' ({len(files)}). Please refine the glob."
 
@@ -68,11 +65,11 @@ def search_project(search_term: str, glob_pattern: str = "**/*") -> str:
                         if search_term in content:
                             matches.append(f"Match in: {file}")
                             count += 1
-                            if count >= 20: # Limit results
+                            if count >= 20: 
                                 matches.append("... (more matches truncated)")
                                 break
                 except:
-                    continue # Skip unreadable files
+                    continue 
         
         if not matches:
             return "No matches found."
@@ -108,7 +105,8 @@ def create_chat(client: genai.Client, model_name: str, history: List = None):
             Your role is to provide high-agency, deep reasoning and analysis on software engineering tasks.
             
             You have access to tools: 'list_directory', 'read_file', and 'search_project'. 
-            USE THEM PROACTIVELY to explore the codebase. Do not ask the user for file contents if you can find them yourself.
+            USE THEM PROACTIVELY to explore the codebase. 
+            You have a massive context window (2M tokens); do not hesitate to read entire files or multiple modules to gather complete context.
             
             Operational Guide:
             1. Context First: Ground your answers strictly in data.
@@ -120,57 +118,33 @@ def create_chat(client: genai.Client, model_name: str, history: List = None):
     )
 
 def get_session(session_id: str, client: genai.Client, requested_model_alias: str):
-    # Resolve alias (e.g., "flash" -> "gemini-3-flash-preview")
     target_model = MODEL_ALIASES.get(requested_model_alias.lower(), requested_model_alias)
     
     if session_id not in sessions:
-        # New session
         sessions[session_id] = create_chat(client, target_model)
-        # Store the model name on the session object for future checks
         sessions[session_id]._gpal_model_name = target_model
     else:
-        # Existing session: Check if migration is needed
         current_session = sessions[session_id]
         current_model = getattr(current_session, "_gpal_model_name", None)
         
         if current_model != target_model:
-            # Migration needed: Create new chat with old history
             try:
-                # We attempt to carry over history
-                # Note: 'history' property returns list of Content objects
+                # Migrate history to new model
                 old_history = current_session._curated_history if hasattr(current_session, "_curated_history") else []
-                # If _curated_history isn't public/stable, we might lose history. 
-                # Ideally verify SDK docs. For now, we assume standard usage.
-                
                 logging.info(f"Migrating session {session_id} from {current_model} to {target_model}")
                 sessions[session_id] = create_chat(client, target_model, history=old_history)
                 sessions[session_id]._gpal_model_name = target_model
             except Exception as e:
-                # Fallback: Just start fresh if migration fails
                 logging.error(f"Failed to migrate session history: {e}")
                 sessions[session_id] = create_chat(client, target_model)
                 sessions[session_id]._gpal_model_name = target_model
                 
     return sessions[session_id]
 
-@mcp.tool()
-def consult_gemini(
-    query: str, 
-    session_id: str = "default", 
-    model: str = "flash", 
-    file_paths: List[str] = []
-) -> str:
-    """
-    Consults with Google Gemini about a query. Supports switching between 'flash' (speed) and 'pro' (reasoning).
-    
-    Args:
-        query: The question or instruction.
-        session_id: ID for conversation history.
-        model: "flash" (default) or "pro". You can switch mid-session.
-        file_paths: (Optional) Pre-load specific files.
-    """
+def _consult_impl(query: str, session_id: str, model_alias: str, file_paths: List[str]) -> str:
+    """Internal implementation for consulting Gemini."""
     client = get_client()
-    session = get_session(session_id, client, model)
+    session = get_session(session_id, client, model_alias)
     
     parts = []
     
@@ -189,6 +163,44 @@ def consult_gemini(
         return response.text
     except Exception as e:
         return f"Error communicating with Gemini: {str(e)}"
+
+# --- Public Tools ---
+
+@mcp.tool()
+def consult_gemini_flash(query: str, session_id: str = "default", file_paths: List[str] = []) -> str:
+    """
+    Consults Gemini 3 Flash (Fast/Efficient). 
+    
+    IMPORTANT: Gemini has its own tools to list directories, read files, and search the project 
+    autonomously. You do not need to provide all file contents; Gemini will explore the codebase 
+    itself to answer your query.
+    
+    Use for: Quick lookups, summarizing files, simple questions, and initial exploration.
+    
+    Args:
+        query: The question or instruction.
+        session_id: ID for conversation history. Shared with Pro.
+        file_paths: (Optional) Pre-load specific files if already known.
+    """
+    return _consult_impl(query, session_id, "flash", file_paths)
+
+@mcp.tool()
+def consult_gemini_pro(query: str, session_id: str = "default", file_paths: List[str] = []) -> str:
+    """
+    Consults Gemini 3 Pro (Reasoning/Deep).
+    
+    IMPORTANT: Gemini has its own tools to list directories, read files, and search the project 
+    autonomously. You do not need to provide all file contents; Gemini will explore the codebase 
+    itself to answer your query.
+    
+    Use for: Complex architectural review, security auditing, difficult debugging, and deep synthesis.
+    
+    Args:
+        query: The question or instruction.
+        session_id: ID for conversation history. Shared with Flash.
+        file_paths: (Optional) Pre-load specific files if already known.
+    """
+    return _consult_impl(query, session_id, "pro", file_paths)
 
 def main():
     mcp.run()

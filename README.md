@@ -7,8 +7,13 @@
 ## Features
 
 *   **Stateful Consulting:** Maintains conversation history (`session_id`), allowing for iterative debugging and architectural debates.
-*   **High-Agency:** Equipped with internal tools (`list_directory`, `read_file`, `search_project`) to autonomously explore your codebase. It doesn't just guess; it checks the files.
-*   **Massive Context:** Leverages Gemini's 1M+ token context window to ingest entire modules or documentation sets.
+*   **High-Agency:** Equipped with internal tools (`list_directory`, `read_file`, `search_project`) to autonomously explore your codebase. When you ask a question, Gemini doesn't just guess; it lists, reads, and searches files itself to gather context.
+*   **Nested Agency:** You can ask your host model (e.g. Claude) to "Ask Gemini to find the bug," and Claude will delegate the entire exploration and analysis task to Gemini.
+*   **Massive Context Window:** Leverages Gemini 3's 2M token context window to ingest entire modules, large files, or extensive documentation sets.
+*   **Multi-Tier Consultation:** Choose between speed and depth:
+    *   `consult_gemini_flash`: For quick lookups, file summaries, and initial exploration. Fast and efficient.
+    *   `consult_gemini_pro`: For complex architectural reviews, security auditing, deep debugging, and synthesis. Slower but provides deeper reasoning.
+    *   **Seamless Switching:** Conversation history is preserved when switching between Flash and Pro for the same `session_id`.
 *   **Open Standard:** Built on MCP, making it compatible with Claude Desktop, Cursor, VS Code, and other MCP clients.
 
 ## Installation
@@ -23,7 +28,7 @@
 
 1.  **Clone the repo:**
     ```bash
-    git clone https://github.com/yourusername/gpal.git
+    git clone https://github.com/tobert/gpal.git
     cd gpal
     ```
 
@@ -43,38 +48,42 @@ Add the following to your `claude_desktop_config.json`:
 {
   "mcpServers": {
     "gpal": {
-      "command": "uv",
+      "command": "bash",
       "args": [
-        "--directory",
-        "/absolute/path/to/gpal",
-        "run",
-        "gpal"
-      ],
-      "env": {
-        "GEMINI_API_KEY": "your_api_key_here"
-      }
+        "-c",
+        "GEMINI_API_KEY=$(< ~/.gpal-api-key) uv --directory /absolute/path/to/gpal run gpal"
+      ]
     }
   }
 }
 ```
 
-Once connected, simply ask Claude:
-> *"Ask Gemini to review `src/main.py` for security vulnerabilities."*
-> *"Consult Gemini: why is my build failing? (It will autonomously search for errors)"*
+Once connected, you will have two new tools: `consult_gemini_flash` and `consult_gemini_pro`.
+
+**Examples:**
+> *"Ask `consult_gemini_flash` to summarize `src/main.py`."*
+> *"Ask `consult_gemini_pro` to identify potential security vulnerabilities in the `auth` module based on the files in `src/gpal/auth.py`."*
 
 ### Programmatic Usage
 
 You can use `gpal` as a library in your own Python agents:
 
 ```python
-from gpal.server import consult_gemini
+from gpal.server import consult_gemini_flash, consult_gemini_pro
 
-# Ask a question, Gemini will search the current directory to answer
-response = consult_gemini.fn(
-    "What license does this project use?", 
+# Use Flash for quick queries
+flash_response = consult_gemini_flash.fn(
+    "List the top-level files in this directory.", 
     session_id="dev-session-1"
 )
-print(response)
+print(f"Flash: {flash_response}")
+
+# Continue the same session with Pro for deeper analysis
+pro_response = consult_gemini_pro.fn(
+    "From the files you just listed, what is the main entry point of the application?", 
+    session_id="dev-session-1"
+)
+print(f"Pro: {pro_response}")
 ```
 
 ## Development
