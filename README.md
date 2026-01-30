@@ -14,6 +14,8 @@ When you ask gpal a question, Gemini doesn't just guess — it **explores your c
 - 🏗️ **Architectural reviews** — "How is authentication implemented?"
 - 🐛 **Bug hunting** — "Why might this function return null?"
 - 📚 **Codebase onboarding** — "Explain how the request pipeline works"
+- 🖼️ **Visual review** — "What's wrong with this screenshot?" (images, video, audio)
+- 📋 **Structured extraction** — "List all API endpoints as JSON"
 
 ## Features
 
@@ -24,6 +26,9 @@ When you ask gpal a question, Gemini doesn't just guess — it **explores your c
 | **2M token context** | Leverages Gemini 3's massive context window |
 | **Two-tier consultation** | Flash for speed, Pro for depth |
 | **Seamless switching** | History preserved when switching between Flash and Pro |
+| **Multimodal** | Analyze images, audio, video, PDFs |
+| **File uploads** | Upload large files to Gemini's File API |
+| **Structured output** | JSON mode with optional schema constraints |
 | **Nested agency** | Claude can delegate entire tasks to Gemini |
 
 ### Flash vs Pro
@@ -81,7 +86,7 @@ Then ask your AI assistant:
 ### Programmatic Usage
 
 ```python
-from gpal.server import consult_gemini_flash, consult_gemini_pro
+from gpal.server import consult_gemini_flash, consult_gemini_pro, upload_file
 
 # Flash: Quick exploration
 result = consult_gemini_flash.fn(
@@ -93,6 +98,25 @@ result = consult_gemini_flash.fn(
 analysis = consult_gemini_pro.fn(
     "Based on those files, explain the architecture",
     session_id="review-1"
+)
+
+# Multimodal: Analyze screenshots or diagrams
+review = consult_gemini_pro.fn(
+    "What's wrong with this UI?",
+    media_paths=["screenshot.png"]
+)
+
+# File upload: For large files (videos, big PDFs)
+uri = upload_file.fn("demo.mp4")
+feedback = consult_gemini_pro.fn(
+    "Review this product demo",
+    file_uris=[uri.split(": ")[1].split(" ")[0]]  # extract URI
+)
+
+# JSON mode: Structured output
+data = consult_gemini_flash.fn(
+    "List the top 5 largest functions",
+    json_mode=True
 )
 ```
 

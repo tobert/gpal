@@ -2,6 +2,19 @@
 
 Internal documentation for gpal development.
 
+## Dogfooding
+
+Before committing changes to gpal, use gpal to review them:
+
+```
+consult_gemini_pro(
+    query="Review server.py for bugs, edge cases, and API misuse",
+    file_paths=["src/gpal/server.py"]
+)
+```
+
+Gemini catches real issues — see git history for proof.
+
 ## Architecture
 
 ```
@@ -73,6 +86,7 @@ Sessions live in memory (`sessions` dict). Same `session_id` = same conversation
 | Constant | Value | Purpose |
 |----------|-------|---------|
 | `MAX_FILE_SIZE` | 10 MB | Prevents accidental large file reads |
+| `MAX_INLINE_MEDIA` | 20 MB | Caps inline media size (use upload_file for larger) |
 | `MAX_SEARCH_FILES` | 1000 | Caps glob expansion |
 | `MAX_SEARCH_MATCHES` | 20 | Truncates search results |
 | `MAX_TOOL_CALLS` | 10 | Limits autonomous tool use per response |
