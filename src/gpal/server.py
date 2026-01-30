@@ -368,10 +368,10 @@ def consult_gemini_flash(
         query: The question or instruction.
         session_id: ID for conversation history. Shared with Pro models.
         file_paths: Text files to include as context.
-        media_paths: Images/audio/video to analyze (embedded inline).
-        file_uris: URIs from upload_file() for large media references.
+        media_paths: Screenshots, diagrams, audio, video (.png, .jpg, .mp3, .mp4, etc.) under ~20MB.
+        file_uris: URIs from upload_file() for large files.
         json_mode: If True, response will be valid JSON.
-        response_schema: JSON Schema string to constrain output structure.
+        response_schema: JSON Schema string, e.g. '{"type": "object", "properties": {...}}'.
     """
     return _consult(
         query, session_id, "flash", file_paths,
@@ -402,10 +402,10 @@ def consult_gemini_pro(
         query: The question or instruction.
         session_id: ID for conversation history. Shared with Flash models.
         file_paths: Text files to include as context.
-        media_paths: Images/audio/video to analyze (embedded inline).
-        file_uris: URIs from upload_file() for large media references.
+        media_paths: Screenshots, diagrams, audio, video (.png, .jpg, .mp3, .mp4, etc.) under ~20MB.
+        file_uris: URIs from upload_file() for large files.
         json_mode: If True, response will be valid JSON.
-        response_schema: JSON Schema string to constrain output structure.
+        response_schema: JSON Schema string, e.g. '{"type": "object", "properties": {...}}'.
     """
     return _consult(
         query, session_id, "pro", file_paths,
