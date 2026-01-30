@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple.svg)](https://modelcontextprotocol.io/)
 
-**Gemini Principal Assistant Layer** — an MCP server that gives your IDE or agent access to Google Gemini with autonomous codebase exploration.
+An MCP server that gives your IDE or agent access to Google Gemini with autonomous codebase exploration. Your pal Gemini.
 
 ## Why gpal?
 
@@ -14,7 +14,7 @@ When you ask gpal a question, Gemini doesn't just guess — it **explores your c
 - 🏗️ **Architectural reviews** — "How is authentication implemented?"
 - 🐛 **Bug hunting** — "Why might this function return null?"
 - 📚 **Codebase onboarding** — "Explain how the request pipeline works"
-- 🖼️ **Visual review** — "What's wrong with this screenshot?" (images, video, audio)
+- 🖼️ **Visual review** — Analyze screenshots, diagrams, video via `media_paths`
 - 📋 **Structured extraction** — "List all API endpoints as JSON"
 
 ## Features
@@ -30,6 +30,8 @@ When you ask gpal a question, Gemini doesn't just guess — it **explores your c
 | **File uploads** | Upload large files to Gemini's File API |
 | **Structured output** | JSON mode with optional schema constraints |
 | **Nested agency** | Claude can delegate entire tasks to Gemini |
+
+**Limits:** 10MB file reads, 20MB inline media, 20 search matches max.
 
 ### Flash vs Pro
 
@@ -67,11 +69,11 @@ Add to your MCP config (e.g., `claude_desktop_config.json`):
 {
   "mcpServers": {
     "gpal": {
-      "command": "bash",
-      "args": [
-        "-c",
-        "GEMINI_API_KEY=$(< ~/.gpal-api-key) uv --directory /path/to/gpal run gpal"
-      ]
+      "command": "uv",
+      "args": ["--directory", "/path/to/gpal", "run", "gpal"],
+      "env": {
+        "GEMINI_API_KEY": "your_key_here"
+      }
     }
   }
 }
@@ -84,6 +86,8 @@ Then ask your AI assistant:
 > "Use `consult_gemini_flash` to find where errors are handled"
 
 ### Programmatic Usage
+
+> **Note:** Sessions live in memory. When used as a library (not MCP server), state is lost when the script exits.
 
 ```python
 from gpal.server import consult_gemini_flash, consult_gemini_pro, upload_file
