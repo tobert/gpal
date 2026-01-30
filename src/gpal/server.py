@@ -7,6 +7,7 @@ autonomous codebase exploration capabilities.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -34,6 +35,38 @@ MODEL_ALIASES: dict[str, str] = {
     "pro": "gemini-3-pro-preview",
 }
 
+# MIME type mappings for multimodal support
+MIME_TYPES: dict[str, str] = {
+    # Images
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    # Video
+    ".mp4": "video/mp4",
+    ".mpeg": "video/mpeg",
+    ".mov": "video/mov",
+    ".avi": "video/x-msvideo",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    # Audio
+    ".wav": "audio/wav",
+    ".mp3": "audio/mp3",
+    ".aiff": "audio/aiff",
+    ".aac": "audio/aac",
+    ".ogg": "audio/ogg",
+    ".flac": "audio/flac",
+    # Documents
+    ".pdf": "application/pdf",
+}
+
+
+def detect_mime_type(path: str) -> str | None:
+    """Detect MIME type from file extension, or None if unknown."""
+    ext = Path(path).suffix.lower()
+    return MIME_TYPES.get(ext)
+
 SYSTEM_INSTRUCTION = """\
 You are a consultant AI accessed via the Model Context Protocol (MCP).
 Your role is to provide high-agency, deep reasoning and analysis on tasks,
@@ -52,6 +85,7 @@ modules when needed to gather complete context.
 
 mcp = FastMCP("gpal")
 sessions: dict[str, Any] = {}
+uploaded_files: dict[str, types.File] = {}  # Cache for Gemini File API uploads
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gemini Internal Tools (for autonomous exploration)
@@ -127,16 +161,54 @@ def get_client() -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
+@mcp.tool()
+def upload_file(file_path: str, display_name: str | None = None) -> str:
+    """
+    Upload a large file to Gemini's File API for use in consultations.
+
+    Files persist for 48 hours on Gemini's servers. Returns a file URI
+    that can be passed to consult_gemini_* tools via the file_uris parameter.
+
+    Use this for:
+    - Large files (videos, PDFs, logs) that exceed inline limits
+    - Files you want to reference in multiple consultations
+
+    Args:
+        file_path: Path to the file to upload.
+        display_name: Optional friendly name for the file.
+
+    Returns:
+        The file URI (e.g., "files/abc123") for use in consultations.
+    """
+    client = get_client()
+    path = Path(file_path)
+
+    if not path.exists():
+        return f"Error: File '{file_path}' does not exist."
+
+    mime_type = detect_mime_type(file_path)
+    config = types.UploadFileConfig(
+        display_name=display_name or path.name,
+        mime_type=mime_type,
+    )
+
+    try:
+        file = client.files.upload(file=str(path), config=config)
+        uploaded_files[file.uri] = file
+        return f"Uploaded: {file.uri} (expires in 48h)"
+    except Exception as e:
+        return f"Error uploading file: {e}"
+
+
 def create_chat(
     client: genai.Client,
     model_name: str,
     history: list[Any] | None = None,
+    config: types.GenerateContentConfig | None = None,
 ) -> Any:
     """Create a configured Gemini chat session."""
-    return client.chats.create(
-        model=model_name,
-        history=history or [],
-        config=types.GenerateContentConfig(
+    if config is None:
+        config = types.GenerateContentConfig(
             temperature=0.2,
             tools=[list_directory, read_file, search_project],
             automatic_function_calling=types.AutomaticFunctionCallingConfig(
@@ -144,16 +216,26 @@ def create_chat(
                 maximum_remote_calls=MAX_TOOL_CALLS,
             ),
             system_instruction=SYSTEM_INSTRUCTION,
-        ),
+        )
+
+    return client.chats.create(
+        model=model_name,
+        history=history or [],
+        config=config,
     )
 
 
-def get_session(session_id: str, client: genai.Client, model_alias: str) -> Any:
+def get_session(
+    session_id: str,
+    client: genai.Client,
+    model_alias: str,
+    config: types.GenerateContentConfig | None = None,
+) -> Any:
     """Get or create a session, migrating history when switching models."""
     target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
 
     if session_id not in sessions:
-        sessions[session_id] = create_chat(client, target_model)
+        sessions[session_id] = create_chat(client, target_model, config=config)
         sessions[session_id]._gpal_model = target_model
         return sessions[session_id]
 
@@ -168,10 +250,10 @@ def get_session(session_id: str, client: genai.Client, model_alias: str) -> Any:
     try:
         # Try _curated_history first (google-genai internal), fall back to .history
         history = getattr(session, "_curated_history", getattr(session, "history", []))
-        sessions[session_id] = create_chat(client, target_model, history=history)
+        sessions[session_id] = create_chat(client, target_model, history=history, config=config)
     except Exception as e:
         logging.error(f"History migration failed: {e}")
-        sessions[session_id] = create_chat(client, target_model)
+        sessions[session_id] = create_chat(client, target_model, config=config)
 
     sessions[session_id]._gpal_model = target_model
     return sessions[session_id]
@@ -186,14 +268,37 @@ def _consult(
     query: str,
     session_id: str,
     model_alias: str,
-    file_paths: list[str] | None,
+    file_paths: list[str] | None = None,
+    media_paths: list[str] | None = None,
+    file_uris: list[str] | None = None,
+    json_mode: bool = False,
+    response_schema: str | None = None,
 ) -> str:
-    """Send a query to Gemini with optional file context."""
+    """Send a query to Gemini with optional file/media context."""
     client = get_client()
-    session = get_session(session_id, client, model_alias)
+
+    # Build generation config
+    gen_config = types.GenerateContentConfig(
+        temperature=0.2,
+        tools=[list_directory, read_file, search_project],
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+            disable=False,
+            maximum_remote_calls=MAX_TOOL_CALLS,
+        ),
+        system_instruction=SYSTEM_INSTRUCTION,
+    )
+
+    # Add JSON mode config if requested
+    if json_mode:
+        gen_config.response_mime_type = "application/json"
+        if response_schema:
+            gen_config.response_schema = json.loads(response_schema)
+
+    session = get_session(session_id, client, model_alias, gen_config)
 
     parts: list[types.Part] = []
 
+    # Text file contents (existing behavior)
     for path in file_paths or []:
         try:
             content = Path(path).read_text(encoding="utf-8")
@@ -202,6 +307,26 @@ def _consult(
             ))
         except Exception as e:
             return f"Error reading file '{path}': {e}"
+
+    # Inline media (images, audio, video - bytes embedded in request)
+    for path in media_paths or []:
+        try:
+            mime_type = detect_mime_type(path)
+            if not mime_type:
+                return f"Error: Unknown media type for '{path}'. Supported: {list(MIME_TYPES.keys())}"
+            data = Path(path).read_bytes()
+            parts.append(types.Part.from_bytes(data=data, mime_type=mime_type))
+        except Exception as e:
+            return f"Error reading media '{path}': {e}"
+
+    # File URI references (previously uploaded via upload_file)
+    for uri in file_uris or []:
+        if uri in uploaded_files:
+            file = uploaded_files[uri]
+            parts.append(types.Part.from_uri(file_uri=file.uri, mime_type=file.mime_type))
+        else:
+            # Assume it's a valid URI even if not in our cache
+            parts.append(types.Part.from_uri(file_uri=uri))
 
     parts.append(types.Part.from_text(text=query))
 
@@ -221,6 +346,10 @@ def consult_gemini_flash(
     query: str,
     session_id: str = "default",
     file_paths: list[str] | None = None,
+    media_paths: list[str] | None = None,
+    file_uris: list[str] | None = None,
+    json_mode: bool = False,
+    response_schema: str | None = None,
 ) -> str:
     """
     Consults Gemini 3 Flash (Fast/Efficient). Context window of 2,000,000 tokens.
@@ -238,9 +367,16 @@ def consult_gemini_flash(
     Args:
         query: The question or instruction.
         session_id: ID for conversation history. Shared with Pro models.
-        file_paths: (Optional) Essential files to get started with exploring.
+        file_paths: Text files to include as context.
+        media_paths: Images/audio/video to analyze (embedded inline).
+        file_uris: URIs from upload_file() for large media references.
+        json_mode: If True, response will be valid JSON.
+        response_schema: JSON Schema string to constrain output structure.
     """
-    return _consult(query, session_id, "flash", file_paths)
+    return _consult(
+        query, session_id, "flash", file_paths,
+        media_paths, file_uris, json_mode, response_schema
+    )
 
 
 @mcp.tool()
@@ -248,6 +384,10 @@ def consult_gemini_pro(
     query: str,
     session_id: str = "default",
     file_paths: list[str] | None = None,
+    media_paths: list[str] | None = None,
+    file_uris: list[str] | None = None,
+    json_mode: bool = False,
+    response_schema: str | None = None,
 ) -> str:
     """
     Consults Gemini 3 Pro (Reasoning/Deep). Context window of 2,000,000 tokens.
@@ -261,9 +401,16 @@ def consult_gemini_pro(
     Args:
         query: The question or instruction.
         session_id: ID for conversation history. Shared with Flash models.
-        file_paths: (Optional) Essential files to get started with exploring.
+        file_paths: Text files to include as context.
+        media_paths: Images/audio/video to analyze (embedded inline).
+        file_uris: URIs from upload_file() for large media references.
+        json_mode: If True, response will be valid JSON.
+        response_schema: JSON Schema string to constrain output structure.
     """
-    return _consult(query, session_id, "pro", file_paths)
+    return _consult(
+        query, session_id, "pro", file_paths,
+        media_paths, file_uris, json_mode, response_schema
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

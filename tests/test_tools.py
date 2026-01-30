@@ -1,7 +1,7 @@
 import os
 import pytest
 from pathlib import Path
-from gpal.server import list_directory, read_file, search_project
+from gpal.server import list_directory, read_file, search_project, detect_mime_type, MIME_TYPES
 
 def test_list_directory(tmp_path):
     # Create a dummy structure
@@ -58,3 +58,40 @@ def test_search_project_no_matches(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = search_project("non_existent_term_xyz_123")
     assert result == "No matches found."
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MIME Type Detection Tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_detect_mime_type_images():
+    assert detect_mime_type("photo.png") == "image/png"
+    assert detect_mime_type("photo.PNG") == "image/png"  # case insensitive
+    assert detect_mime_type("/path/to/image.jpg") == "image/jpeg"
+    assert detect_mime_type("file.jpeg") == "image/jpeg"
+    assert detect_mime_type("animation.gif") == "image/gif"
+    assert detect_mime_type("modern.webp") == "image/webp"
+
+
+def test_detect_mime_type_video():
+    assert detect_mime_type("video.mp4") == "video/mp4"
+    assert detect_mime_type("clip.mov") == "video/mov"
+    assert detect_mime_type("stream.webm") == "video/webm"
+    assert detect_mime_type("movie.mkv") == "video/x-matroska"
+
+
+def test_detect_mime_type_audio():
+    assert detect_mime_type("sound.wav") == "audio/wav"
+    assert detect_mime_type("song.mp3") == "audio/mp3"
+    assert detect_mime_type("track.flac") == "audio/flac"
+    assert detect_mime_type("podcast.ogg") == "audio/ogg"
+
+
+def test_detect_mime_type_documents():
+    assert detect_mime_type("document.pdf") == "application/pdf"
+
+
+def test_detect_mime_type_unknown():
+    assert detect_mime_type("file.xyz") is None
+    assert detect_mime_type("noextension") is None
+    assert detect_mime_type(".hidden") is None
