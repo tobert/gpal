@@ -111,6 +111,8 @@ uv run pytest              # Run tests
 uv run pytest -v           # Verbose output
 ```
 
+⚠️ **Note:** Integration tests (`test_connectivity.py`, `test_agentic.py`, `test_switching.py`) make live API calls and will incur Gemini API costs.
+
 ## Known Limitations / TODO
 
 - **Semantic search is MCP-only**: `semantic_search` and `rebuild_index` are available to MCP clients (Claude, Cursor) but not to Gemini's internal autonomous tools. Adding chromadb-based functions to Gemini's tool list causes mysterious failures (likely google-genai + chromadb compatibility issue). Investigate later.

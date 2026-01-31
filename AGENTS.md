@@ -137,6 +137,7 @@ uv sync --all-extras
 uv run pytest tests/test_tools.py tests/test_index.py -v
 
 # Manual integration tests (requires GEMINI_API_KEY)
+# ⚠️ These make live API calls and will incur Gemini API costs!
 export GEMINI_API_KEY="..."
 uv run python tests/test_connectivity.py
 uv run python tests/test_agentic.py

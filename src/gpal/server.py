@@ -504,6 +504,30 @@ def _consult(
         except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
             return f"Error: Service temporarily unavailable after retries: {e}"
         except Exception as e:
+            error_msg = str(e).lower()
+            # Detect stale client (httpx: "client is closed", grpc: "client has been closed")
+            if "client" in error_msg and ("closed" in error_msg or "shutdown" in error_msg):
+                logging.warning(f"Session '{session_id}' has stale client, recreating...")
+
+                # Preserve conversation history from stale session
+                prev_history = getattr(session, "_curated_history", getattr(session, "history", []))
+                prev_model = getattr(session, "_gpal_model", model_alias)
+
+                try:
+                    # Manually recreate session (avoid get_session to prevent lock replacement)
+                    new_client = get_client()
+                    target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
+                    new_session = create_chat(new_client, target_model, history=prev_history, config=gen_config)
+                    new_session._gpal_model = prev_model
+
+                    # Update cache while holding session lock (prevents concurrent access)
+                    # Only acquire sessions_lock briefly for dict update
+                    with sessions_lock:
+                        sessions[session_id] = new_session
+
+                    return _send_with_retry(new_session, parts, gen_config)
+                except Exception as retry_e:
+                    return f"Error after retry: {retry_e}"
             return f"Error: {e}"
 
 

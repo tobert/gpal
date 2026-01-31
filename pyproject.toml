@@ -16,14 +16,14 @@ classifiers = [
 ]
 
 dependencies = [
-    "chromadb>=0.4",
+    "chromadb>=1.4.1",
     "fastmcp>=2.14.4",
-    "google-api-core>=2.0",
-    "google-genai>=1.60.0",
+    "google-api-core>=2.29.0",
+    "google-genai>=1.61.0",
     "mcp[cli]>=1.26.0",
-    "pathspec>=0.11",
+    "pathspec>=1.0.4",
     "python-dotenv>=1.2.1",
-    "tenacity>=8.2",
+    "tenacity>=9.1.2",
 ]
 
 [project.optional-dependencies]
