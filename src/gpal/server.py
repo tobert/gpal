@@ -42,10 +42,33 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Retry & Rate Limiting
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Track last 503 to implement cooldown
+_last_503_time: float = 0.0
+_503_cooldown_seconds: float = 5.0  # Wait at least this long after a 503
+
+def _check_503_cooldown() -> None:
+    """If we recently hit a 503, wait before making another request."""
+    global _last_503_time
+    if _last_503_time > 0:
+        elapsed = time.time() - _last_503_time
+        if elapsed < _503_cooldown_seconds:
+            wait = _503_cooldown_seconds - elapsed
+            logging.info(f"503 cooldown: waiting {wait:.1f}s before next request")
+            time.sleep(wait)
+
+def _record_503() -> None:
+    """Record that we hit a 503 error."""
+    global _last_503_time
+    _last_503_time = time.time()
+
 # Configure retry decorator for Gemini API calls
 GEMINI_RETRY_DECORATOR = retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=30),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2, min=2, max=60),
     retry=retry_if_exception_type(
         (ServiceUnavailable, ResourceExhausted, InternalServerError)
     ),
@@ -325,6 +348,7 @@ def _gemini_search(
     model: str = "gemini-2.0-flash",
 ) -> str:
     """Internal implementation of web search with automatic retry on 503/429."""
+    _check_503_cooldown()
     try:
         client = get_client()
 
@@ -352,7 +376,7 @@ def _gemini_search(
         return "No results returned."
 
     except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
-        # Re-raise for tenacity to retry
+        _record_503()
         logging.warning(f"Search request failed with {type(e).__name__}: {e}")
         raise
     except Exception as e:
@@ -371,6 +395,7 @@ def _gemini_code_exec(
     Note: Code execution service can be more resource-constrained than
     general text generation, so transient 503 errors are more common.
     """
+    _check_503_cooldown()
     try:
         client = get_client()
 
@@ -401,7 +426,7 @@ def _gemini_code_exec(
         return "Code executed (no output)."
 
     except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
-        # Re-raise for tenacity to retry
+        _record_503()
         logging.warning(f"Code execution request failed with {type(e).__name__}: {e}")
         raise
     except Exception as e:
@@ -476,18 +501,22 @@ def _consult(
     parts.append(types.Part.from_text(text=query))
 
     # Apply retry logic to the send_message call
-    max_retries = 3
+    max_retries = 5
     last_exception = None
 
     for attempt in range(max_retries):
+        _check_503_cooldown()  # Respect cooldown from recent 503s
         try:
             return session.send_message(parts, config=gen_config).text
         except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
+            _record_503()  # Track for cooldown
             last_exception = e
             if attempt < max_retries - 1:
-                wait_time = 2**attempt  # Exponential backoff: 1s, 2s, 4s
+                # Exponential backoff: 2, 4, 8, 16, 32s (capped at 60)
+                wait_time = min(2 ** (attempt + 1), 60)
                 logging.warning(
-                    f"Consult attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s..."
+                    f"Consult attempt {attempt + 1}/{max_retries} failed: {e}. "
+                    f"Retrying in {wait_time}s..."
                 )
                 time.sleep(wait_time)
             else:
