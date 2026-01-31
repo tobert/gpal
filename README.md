@@ -120,6 +120,10 @@ uv run pytest -v           # Verbose output
 - **Serial indexing**: `rebuild_index()` processes files sequentially. For large codebases this is slow. Future: parallelize with `ThreadPoolExecutor`.
 - **Nested .gitignore**: Only reads root `.gitignore`, ignores nested ones (common in monorepos).
 
+## See Also
+
+- **[cpal](https://github.com/tobert/cpal)** — The inverse: an MCP server that lets Gemini (or any MCP client) consult Claude. Your pal Claude.
+
 ## License
 
 MIT — see [LICENSE](LICENSE)
