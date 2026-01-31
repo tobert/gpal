@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 from google import genai
 from google.genai import types
+from google.genai.types import Tool, GoogleSearch, ToolCodeExecution
 
 load_dotenv()
 
@@ -31,6 +32,7 @@ MAX_INLINE_MEDIA = 20 * 1024 * 1024  # 20 MB - inline media limit
 MAX_SEARCH_FILES = 1000
 MAX_SEARCH_MATCHES = 20
 MAX_TOOL_CALLS = 10
+MAX_SEARCH_RESULTS = 10
 
 MODEL_ALIASES: dict[str, str] = {
     "flash": "gemini-3-flash-preview",
@@ -75,7 +77,7 @@ def detect_mime_type(path: str) -> str | None:
     ext = Path(path).suffix.lower()
     return MIME_TYPES.get(ext)
 
-SYSTEM_INSTRUCTION = """\
+SYSTEM_INSTRUCTION = """
 You are a consultant AI accessed via the Model Context Protocol (MCP).
 Your role is to provide high-agency, deep reasoning and analysis on tasks,
 usually in git repositories.
@@ -91,21 +93,29 @@ modules when needed to gather complete context.
 # Server & State
 # ─────────────────────────────────────────────────────────────────────────────
 
+from cachetools import TTLCache
+
 mcp = FastMCP("gpal")
-sessions: dict[str, Any] = {}
+sessions: TTLCache = TTLCache(maxsize=100, ttl=3600)  # 1 hour TTL
 sessions_lock = threading.Lock()
+session_locks: dict[str, threading.Lock] = {}
 uploaded_files: dict[str, types.File] = {}  # Cache for Gemini File API uploads
 _indexes: dict = {}  # Cache for semantic search indexes
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Gemini Internal Tools (for autonomous exploration)
+# Codebase Exploration Tools (Local)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def list_directory(path: str = ".") -> list[str]:
     """List files and directories at the given path."""
     try:
-        p = Path(path)
+        p = Path(path).resolve()
+        cwd = Path.cwd().resolve()
+        
+        if not p.is_relative_to(cwd):
+            return [f"Error: Access denied to '{path}' (outside project root)."]
+            
         if not p.exists():
             return [f"Error: Path '{path}' does not exist."]
         return [item.name for item in p.iterdir()]
@@ -116,7 +126,15 @@ def list_directory(path: str = ".") -> list[str]:
 def read_file(path: str) -> str:
     """Read the content of a file (up to MAX_FILE_SIZE bytes)."""
     try:
-        p = Path(path)
+        p = Path(path).resolve()
+        cwd = Path.cwd().resolve()
+        
+        if not p.is_relative_to(cwd):
+            return f"Error: Access denied to '{path}' (outside project root)."
+            
+        if not p.exists():
+            return f"Error: File '{path}' does not exist."
+            
         if p.stat().st_size > MAX_FILE_SIZE:
             return f"Error: File '{path}' exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit."
         return p.read_text(encoding="utf-8")
@@ -130,6 +148,13 @@ def search_project(search_term: str, glob_pattern: str = "**/*") -> str:
     Returns a summary of matching files.
     """
     try:
+        cwd = Path.cwd().resolve()
+        
+        # Basic validation to prevent obvious traversal
+        if ".." in glob_pattern:
+             return "Error: Glob pattern cannot contain '..'"
+             
+        # Resolve files relative to CWD
         files = globlib.glob(glob_pattern, recursive=True)
 
         if len(files) > MAX_SEARCH_FILES:
@@ -140,8 +165,12 @@ def search_project(search_term: str, glob_pattern: str = "**/*") -> str:
 
         matches = []
         for filepath in files:
-            if not os.path.isfile(filepath):
+            path_obj = Path(filepath).resolve()
+            
+            # Ensure file is within project root
+            if not path_obj.is_relative_to(cwd) or not path_obj.is_file():
                 continue
+                
             try:
                 with open(filepath, encoding="utf-8", errors="ignore") as f:
                     if search_term in f.read():
@@ -180,185 +209,6 @@ def get_index(root: str = "."):
         _indexes[key] = CodebaseIndex(root_path, get_client())
     return _indexes[key]
 
-
-@mcp.tool()
-def upload_file(file_path: str, display_name: str | None = None) -> str:
-    """
-    Upload a large file to Gemini's File API for use in consultations.
-
-    Files persist for 48 hours on Gemini's servers. Returns a file URI
-    that can be passed to consult_gemini_* tools via the file_uris parameter.
-
-    Use this for:
-    - Large files (videos, PDFs, logs) that exceed inline limits
-    - Files you want to reference in multiple consultations
-
-    Args:
-        file_path: Path to the file to upload.
-        display_name: Optional friendly name for the file.
-
-    Returns:
-        The file URI (e.g., "files/abc123") for use in consultations.
-    """
-    client = get_client()
-    path = Path(file_path)
-
-    if not path.exists():
-        return f"Error: File '{file_path}' does not exist."
-
-    mime_type = detect_mime_type(file_path)
-    config = types.UploadFileConfig(
-        display_name=display_name or path.name,
-        mime_type=mime_type,
-    )
-
-    try:
-        file = client.files.upload(file=str(path), config=config)
-        uploaded_files[file.uri] = file
-        return f"Uploaded: {file.uri} (expires in 48h)"
-    except Exception as e:
-        return f"Error uploading file: {e}"
-
-
-@mcp.tool()
-def semantic_search(query: str, limit: int = 5, path: str = ".") -> str:
-    """
-    Find code semantically related to the query using vector embeddings.
-
-    Unlike text search, this finds code by meaning. "auth logic" finds
-    verify_jwt_token() even without exact keyword matches.
-
-    Args:
-        query: Natural language description of what you're looking for.
-        limit: Maximum results to return (default 5).
-        path: Project root to search (default: current directory).
-
-    Returns:
-        Matching code chunks with file paths, line numbers, and relevance scores.
-    """
-    try:
-        index = get_index(path)
-        results = index.search(query, limit)
-        if not results:
-            return "No matches found. Try rebuilding the index with rebuild_index()."
-
-        output = []
-        for r in results:
-            output.append(f"**{r['file']}:{r['lines']}** (score: {r['score']})")
-            output.append(f"```\n{r['snippet']}\n```\n")
-        return "\n".join(output)
-    except Exception as e:
-        return f"Error searching: {e}"
-
-
-@mcp.tool()
-def rebuild_index(path: str = ".") -> str:
-    """
-    Rebuild the semantic search index for a codebase.
-
-    Run this when:
-    - First time using semantic search on a project
-    - After major code changes
-    - If search results seem stale
-
-    Index is stored in ~/.local/share/gpal/index/ (XDG compliant).
-
-    Args:
-        path: Project root to index (default: current directory).
-
-    Returns:
-        Summary of indexed files.
-    """
-    try:
-        index = get_index(path)
-        result = index.rebuild()
-        indexed = result.get("indexed", 0)
-        skipped = result.get("skipped", 0)
-        removed = result.get("removed", 0)
-        return (
-            f"Index rebuilt: {indexed} indexed, {skipped} unchanged, {removed} removed. "
-            f"Stored at: {index.db_path}"
-        )
-    except Exception as e:
-        return f"Error rebuilding index: {e}"
-
-
-@mcp.tool()
-def generate_image(prompt: str, output_path: str) -> str:
-    """
-    Generates an image using Imagen 3 models.
-
-    Args:
-        prompt: The image description.
-        output_path: Path to save the generated image (e.g., "assets/image.png").
-    """
-    client = get_client()
-    try:
-        # Create parent directories if they don't exist
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-
-        response = client.models.generate_images(
-            model="imagen-4.0-generate-001",
-            prompt=prompt,
-            config=types.GenerateImagesConfig(
-                number_of_images=1,
-            )
-        )
-        if response.generated_images:
-            image_bytes = response.generated_images[0].image.image_bytes
-            Path(output_path).write_bytes(image_bytes)
-            return f"Image generated and saved to {output_path}"
-        return "No image generated."
-    except Exception as e:
-        return f"Error generating image: {e}"
-
-
-@mcp.tool()
-def generate_speech(text: str, output_path: str, voice_name: str = "Puck") -> str:
-    """
-    Synthesizes speech from text.
-
-    Args:
-        text: The text to convert to speech.
-        output_path: Path to save the audio file (e.g., "assets/speech.wav").
-        voice_name: Voice to use (e.g., "Puck", "Charon", "Kore", "Fenrir", "Aoede").
-    """
-    client = get_client()
-    try:
-        # Create parent directories if they don't exist
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-preview-tts",
-            contents=text,
-            config=types.GenerateContentConfig(
-                response_modalities=["AUDIO"],
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                            voice_name=voice_name
-                        )
-                    )
-                )
-            )
-        )
-
-        audio_bytes = b""
-        if response.candidates:
-            for part in response.candidates[0].content.parts:
-                if part.inline_data and "audio" in part.inline_data.mime_type:
-                    audio_bytes += part.inline_data.data
-
-        if audio_bytes:
-            Path(output_path).write_bytes(audio_bytes)
-            return f"Speech generated and saved to {output_path}"
-        return "No audio content generated."
-    except Exception as e:
-        return f"Error generating speech: {e}"
-
-
-
-
 def create_chat(
     client: genai.Client,
     model_name: str,
@@ -383,7 +233,6 @@ def create_chat(
         config=config,
     )
 
-
 def get_session(
     session_id: str,
     client: genai.Client,
@@ -397,10 +246,27 @@ def get_session(
         if session_id not in sessions:
             sessions[session_id] = create_chat(client, target_model, config=config)
             sessions[session_id]._gpal_model = target_model
+            session_locks[session_id] = threading.Lock()
             return sessions[session_id]
+        
+        # Ensure lock exists for existing session
+        if session_id not in session_locks:
+            session_locks[session_id] = threading.Lock()
 
+    # Use per-session lock for migration checks and updates
+    with session_locks[session_id]:
         session = sessions[session_id]
         current_model = getattr(session, "_gpal_model", None)
+
+        # Update config if provided (handles json_mode/schema switches)
+        if config:
+            # Note: This relies on the SDK exposing a way to update config, or we recreate the chat
+            # Since chat objects are stateful, we might need to recreate if config is fundamentally different
+            # For now, we'll recreate if JSON mode requirements change, or just set it on the next message
+            # The SDK's send_message accepts a config override, which we use in _consult.
+            # So the session object itself doesn't strictly need the new config permanently, 
+            # as long as we pass it to send_message.
+            pass
 
         if current_model == target_model:
             return session
@@ -420,9 +286,69 @@ def get_session(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Core Implementation
+# Internal Implementations (Testable)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+def _gemini_search(
+    query: str,
+    num_results: int = 5,
+    model: str = "gemini-3-flash-preview",
+) -> str:
+    """Internal implementation of web search."""
+    try:
+        client = get_client()
+        num_results = max(1, min(num_results, MAX_SEARCH_RESULTS))
+
+        response = client.models.generate_content(
+            model=model,
+            contents=f"Search for: {query}\n\nProvide the top {num_results} most relevant results with titles, URLs, and summaries.",
+            config=types.GenerateContentConfig(
+                tools=[Tool(google_search=GoogleSearch())],
+                temperature=0.1,
+            ),
+        )
+
+        if response.candidates and response.candidates[0].content.parts:
+            text = "".join(p.text for p in response.candidates[0].content.parts if hasattr(p, 'text') and p.text)
+            return text.strip() or "No results returned."
+        
+        return "No results returned."
+    except Exception as e:
+        return f"Error performing search: {e}"
+
+
+def _gemini_code_exec(
+    code: str,
+    model: str = "gemini-3-flash-preview",
+) -> str:
+    """Internal implementation of code execution."""
+    try:
+        client = get_client()
+        response = client.models.generate_content(
+            model=model,
+            contents=f"Execute this Python code and show the output:\n\n```python\n{code}\n```",
+            config=types.GenerateContentConfig(
+                tools=[Tool(code_execution=ToolCodeExecution())],
+                temperature=0,
+            ),
+        )
+
+        output = []
+        if response.candidates and response.candidates[0].content.parts:
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'text') and part.text:
+                    output.append(part.text)
+                if part.executable_code:
+                    output.append(f"\nExecuted Code:\n{part.executable_code.code}\n")
+                if part.code_execution_result:
+                    output.append(f"\nOutput:\n{part.code_execution_result.output}\n")
+            
+            return "".join(output).strip() or "Code executed (no output)."
+        
+        return "Code executed (no output)."
+    except Exception as e:
+        return f"Error executing code: {e}"
 
 def _consult(
     query: str,
@@ -434,31 +360,35 @@ def _consult(
     json_mode: bool = False,
     response_schema: str | None = None,
 ) -> str:
-    """Send a query to Gemini with optional file/media context."""
+    """Send a query to Gemini with codebase context."""
     client = get_client()
 
     # Build generation config
-    gen_config = types.GenerateContentConfig(
-        temperature=0.2,
-        tools=[list_directory, read_file, search_project],
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+    config_kwargs = {
+        "temperature": 0.2,
+        "tools": [list_directory, read_file, search_project],
+        "automatic_function_calling": types.AutomaticFunctionCallingConfig(
             disable=False,
             maximum_remote_calls=MAX_TOOL_CALLS,
         ),
-        system_instruction=SYSTEM_INSTRUCTION,
-    )
+        "system_instruction": SYSTEM_INSTRUCTION,
+    }
 
-    # Add JSON mode config if requested
     if json_mode:
-        gen_config.response_mime_type = "application/json"
+        config_kwargs["response_mime_type"] = "application/json"
         if response_schema:
-            gen_config.response_schema = json.loads(response_schema)
+            try:
+                config_kwargs["response_schema"] = json.loads(response_schema)
+            except json.JSONDecodeError as e:
+                return f"Error: Invalid JSON schema: {e}"
+
+    gen_config = types.GenerateContentConfig(**config_kwargs)
 
     session = get_session(session_id, client, model_alias, gen_config)
 
     parts: list[types.Part] = []
 
-    # Text file contents (existing behavior)
+    # Context: Text files
     for path in file_paths or []:
         try:
             content = Path(path).read_text(encoding="utf-8")
@@ -468,41 +398,63 @@ def _consult(
         except Exception as e:
             return f"Error reading file '{path}': {e}"
 
-    # Inline media (images, audio, video - bytes embedded in request)
+    # Context: Inline media
     for path in media_paths or []:
         try:
             p = Path(path)
             if p.stat().st_size > MAX_INLINE_MEDIA:
-                return f"Error: '{path}' exceeds {MAX_INLINE_MEDIA // (1024*1024)}MB inline limit. Use upload_file() instead."
+                return f"Error: '{path}' exceeds {MAX_INLINE_MEDIA // (1024*1024)}MB inline limit."
             mime_type = detect_mime_type(path)
             if not mime_type:
-                return f"Error: Unknown media type for '{path}'. Supported: {list(MIME_TYPES.keys())}"
-            data = p.read_bytes()
-            parts.append(types.Part.from_bytes(data=data, mime_type=mime_type))
+                return f"Error: Unknown media type for '{path}'."
+            parts.append(types.Part.from_bytes(data=p.read_bytes(), mime_type=mime_type))
         except Exception as e:
             return f"Error reading media '{path}': {e}"
 
-    # File URI references (previously uploaded via upload_file)
+    # Context: File URIs
     for uri in file_uris or []:
-        if uri in uploaded_files:
-            file = uploaded_files[uri]
-            parts.append(types.Part.from_uri(file_uri=file.uri, mime_type=file.mime_type))
-        else:
-            # Assume it's a valid URI even if not in our cache
-            parts.append(types.Part.from_uri(file_uri=uri))
+        parts.append(types.Part.from_uri(file_uri=uri))
 
     parts.append(types.Part.from_text(text=query))
 
     try:
-        # Pass config to ensure JSON mode applies even on existing sessions
         return session.send_message(parts, config=gen_config).text
     except Exception as e:
-        return f"Error communicating with Gemini: {e}"
+        return f"Error: {e}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MCP Tools (exposed to clients)
+# MCP Tools (Exposed)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def gemini_search(
+    query: str,
+    num_results: int = 5,
+    model: str = "gemini-3-flash-preview",
+) -> str:
+    """
+    Search the web using Gemini's built-in Google Search.
+    
+    Returns formatted search results (titles, URLs, snippets).
+    Stateless utility.
+    """
+    return _gemini_search(query, num_results, model)
+
+
+@mcp.tool()
+def gemini_code_exec(
+    code: str,
+    model: str = "gemini-3-flash-preview",
+) -> str:
+    """
+    Execute Python code using Gemini's built-in code execution sandbox.
+    
+    Returns stdout, stderr, and any execution results.
+    Stateless utility.
+    """
+    return _gemini_code_exec(code, model)
 
 
 @mcp.tool()
@@ -516,26 +468,9 @@ def consult_gemini_flash(
     response_schema: str | None = None,
 ) -> str:
     """
-    Consults Gemini 3 Flash (Fast/Efficient). Context window of 2,000,000 tokens.
-
-    Gemini has its own tools to list directories, read files, and search the project
-    autonomously. You do not need to provide all file contents.
-
-    LIMITED USE FOR FLASH MODEL: High-speed exploration and context gathering. Use this tool FIRST to:
-    1. Map out the project structure (list_directory).
-    2. Locate specific code (search_project).
-    3. Read and summarize files (read_file).
-
-    Once the relevant context is gathered, switch to 'consult_gemini_pro'.
-
-    Args:
-        query: The question or instruction.
-        session_id: ID for conversation history. Shared with Pro models.
-        file_paths: Text files to include as context.
-        media_paths: Screenshots, diagrams, audio, video (.png, .jpg, .mp3, .mp4, etc.) under ~20MB.
-        file_uris: URIs from upload_file() for large files.
-        json_mode: If True, response will be valid JSON.
-        response_schema: JSON Schema string, e.g. '{"type": "object", "properties": {...}}'.
+    Consults Gemini 3 Flash (Fast/Efficient) for codebase exploration.
+    
+    Gemini has autonomous access to: list_directory, read_file, search_project.
     """
     return _consult(
         query, session_id, "flash", file_paths,
@@ -554,22 +489,9 @@ def consult_gemini_pro(
     response_schema: str | None = None,
 ) -> str:
     """
-    Consults Gemini 3 Pro (Reasoning/Deep). Context window of 2,000,000 tokens.
-
-    Gemini has its own tools to list directories, read files, and search the project.
-    autonomously. You do not need to provide all file contents. Encourage it to read
-    whole files and provide holistic feedback.
-
-    PRIMARY USE FOR PRO MODEL: reviews, second opinions, thinking, philosophy, synthesis, and coding.
-
-    Args:
-        query: The question or instruction.
-        session_id: ID for conversation history. Shared with Flash models.
-        file_paths: Text files to include as context.
-        media_paths: Screenshots, diagrams, audio, video (.png, .jpg, .mp3, .mp4, etc.) under ~20MB.
-        file_uris: URIs from upload_file() for large files.
-        json_mode: If True, response will be valid JSON.
-        response_schema: JSON Schema string, e.g. '{"type": "object", "properties": {...}}'.
+    Consults Gemini 3 Pro (Reasoning/Deep) for deep codebase analysis.
+    
+    Gemini has autonomous access to: list_directory, read_file, search_project.
     """
     return _consult(
         query, session_id, "pro", file_paths,
@@ -577,14 +499,93 @@ def consult_gemini_pro(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry Point
-# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool()
+def upload_file(file_path: str, display_name: str | None = None) -> str:
+    """Upload a large file to Gemini's File API."""
+    client = get_client()
+    path = Path(file_path)
+    if not path.exists():
+        return f"Error: File '{file_path}' does not exist."
+    mime_type = detect_mime_type(file_path)
+    config = types.UploadFileConfig(display_name=display_name or path.name, mime_type=mime_type)
+    try:
+        file = client.files.upload(file=str(path), config=config)
+        uploaded_files[file.uri] = file
+        return f"Uploaded: {file.uri}"
+    except Exception as e:
+        return f"Error: {e}"
 
+
+@mcp.tool()
+def semantic_search(query: str, limit: int = 5, path: str = ".") -> str:
+    """Find code semantically related to the query using vector embeddings."""
+    try:
+        index = get_index(path)
+        results = index.search(query, limit)
+        if not results:
+            return "No matches found. Try rebuilding the index."
+        output = []
+        for r in results:
+            output.append(f"**{r['file']}:{r['lines']}** (score: {r['score']})\n```\n{r['snippet']}\n```\n")
+        return "\n".join(output)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def rebuild_index(path: str = ".") -> str:
+    """Rebuild the semantic search index for a codebase."""
+    try:
+        index = get_index(path)
+        result = index.rebuild()
+        return f"Index rebuilt: {result.get('indexed', 0)} indexed, {result.get('skipped', 0)} unchanged."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def generate_image(prompt: str, output_path: str) -> str:
+    """Generates an image using Imagen 3 models."""
+    client = get_client()
+    try:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        response = client.models.generate_images(model="imagen-4.0-generate-001", prompt=prompt, config=types.GenerateImagesConfig(number_of_images=1))
+        if response.generated_images:
+            Path(output_path).write_bytes(response.generated_images[0].image.image_bytes)
+            return f"Image generated and saved to {output_path}"
+        return "No image generated."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def generate_speech(text: str, output_path: str, voice_name: str = "Puck") -> str:
+    """Synthesizes speech from text."""
+    client = get_client()
+    try:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-preview-tts",
+            contents=text,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)))
+            )
+        )
+        audio_bytes = b""
+        if response.candidates:
+            for part in response.candidates[0].content.parts:
+                if part.inline_data and "audio" in part.inline_data.mime_type:
+                    audio_bytes += part.inline_data.data
+        if audio_bytes:
+            Path(output_path).write_bytes(audio_bytes)
+            return f"Speech generated and saved to {output_path}"
+        return "No audio content generated."
+    except Exception as e:
+        return f"Error: {e}"
 
 def main() -> None:
     mcp.run()
-
 
 if __name__ == "__main__":
     main()
