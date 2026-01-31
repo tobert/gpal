@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import threading
-import time
 from pathlib import Path
 from typing import Any
 
@@ -43,29 +42,31 @@ logging.basicConfig(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Retry & Rate Limiting
+# Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Track last 503 to implement cooldown
-_last_503_time: float = 0.0
-_503_cooldown_seconds: float = 5.0  # Wait at least this long after a 503
+# Model versions (centralized for easy updates)
+MODEL_FLASH = "gemini-3-flash-preview"
+MODEL_PRO = "gemini-3-pro-preview"
+MODEL_SEARCH = "gemini-2.0-flash"        # Search/code exec use stable 2.0
+MODEL_CODE_EXEC = "gemini-2.0-flash"
+MODEL_IMAGE = "imagen-4.0-generate-001"
+MODEL_SPEECH = "gemini-2.5-flash-preview-tts"
 
-def _check_503_cooldown() -> None:
-    """If we recently hit a 503, wait before making another request."""
-    global _last_503_time
-    if _last_503_time > 0:
-        elapsed = time.time() - _last_503_time
-        if elapsed < _503_cooldown_seconds:
-            wait = _503_cooldown_seconds - elapsed
-            logging.info(f"503 cooldown: waiting {wait:.1f}s before next request")
-            time.sleep(wait)
+MODEL_ALIASES: dict[str, str] = {
+    "flash": MODEL_FLASH,
+    "pro": MODEL_PRO,
+}
 
-def _record_503() -> None:
-    """Record that we hit a 503 error."""
-    global _last_503_time
-    _last_503_time = time.time()
+# Limits
+MAX_FILE_SIZE = 10 * 1024 * 1024    # 10 MB - prevents accidental DOS
+MAX_INLINE_MEDIA = 20 * 1024 * 1024  # 20 MB - inline media limit
+MAX_SEARCH_FILES = 1000
+MAX_SEARCH_MATCHES = 20
+MAX_TOOL_CALLS = 10
+MAX_SEARCH_RESULTS = 10
 
-# Configure retry decorator for Gemini API calls
+# Retry configuration (tenacity handles all backoff)
 GEMINI_RETRY_DECORATOR = retry(
     stop=stop_after_attempt(5),
     wait=wait_exponential(multiplier=2, min=2, max=60),
@@ -75,22 +76,6 @@ GEMINI_RETRY_DECORATOR = retry(
     before_sleep=before_sleep_log(logging.getLogger(__name__), logging.WARNING),
     reraise=True,
 )
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Configuration
-# ─────────────────────────────────────────────────────────────────────────────
-
-MAX_FILE_SIZE = 10 * 1024 * 1024    # 10 MB - prevents accidental DOS
-MAX_INLINE_MEDIA = 20 * 1024 * 1024  # 20 MB - inline media limit
-MAX_SEARCH_FILES = 1000
-MAX_SEARCH_MATCHES = 20
-MAX_TOOL_CALLS = 10
-MAX_SEARCH_RESULTS = 10
-
-MODEL_ALIASES: dict[str, str] = {
-    "flash": "gemini-3-flash-preview",
-    "pro": "gemini-3-pro-preview",
-}
 
 # MIME type mappings for multimodal support
 MIME_TYPES: dict[str, str] = {
@@ -200,35 +185,36 @@ def search_project(search_term: str, glob_pattern: str = "**/*") -> str:
     """
     try:
         cwd = Path.cwd().resolve()
-        
+
         # Basic validation to prevent obvious traversal
         if ".." in glob_pattern:
-             return "Error: Glob pattern cannot contain '..'"
-             
-        # Resolve files relative to CWD
-        files = globlib.glob(glob_pattern, recursive=True)
+            return "Error: Glob pattern cannot contain '..'"
 
-        if len(files) > MAX_SEARCH_FILES:
-            return (
-                f"Error: Too many files match '{glob_pattern}' ({len(files)}). "
-                "Please use a more specific pattern."
-            )
-
+        # Use iglob iterator to avoid loading huge file lists into memory
         matches = []
-        for filepath in files:
+        files_checked = 0
+
+        for filepath in globlib.iglob(glob_pattern, recursive=True):
+            files_checked += 1
+            if files_checked > MAX_SEARCH_FILES:
+                return (
+                    f"Error: Too many files match '{glob_pattern}' (>{MAX_SEARCH_FILES}). "
+                    "Use a more specific pattern, or try semantic_search for large codebases."
+                )
+
             path_obj = Path(filepath).resolve()
-            
+
             # Ensure file is within project root
             if not path_obj.is_relative_to(cwd) or not path_obj.is_file():
                 continue
-                
+
             try:
                 with open(filepath, encoding="utf-8", errors="ignore") as f:
                     if search_term in f.read():
                         matches.append(f"Match in: {filepath}")
                         if len(matches) >= MAX_SEARCH_MATCHES:
                             matches.append("... (truncated)")
-                            break
+                            return "\n".join(matches)
             except OSError:
                 continue
 
@@ -345,93 +331,68 @@ def get_session(
 def _gemini_search(
     query: str,
     num_results: int = 5,
-    model: str = "gemini-2.0-flash",
+    model: str = MODEL_SEARCH,
 ) -> str:
-    """Internal implementation of web search with automatic retry on 503/429."""
-    _check_503_cooldown()
-    try:
-        client = get_client()
+    """Internal implementation of web search with automatic retry."""
+    client = get_client()
 
-        # Clamp num_results
-        num_results = max(1, min(num_results, MAX_SEARCH_RESULTS))
+    # Clamp num_results
+    num_results = max(1, min(num_results, MAX_SEARCH_RESULTS))
 
-        # Single stateless API call with Google Search tool
-        response = client.models.generate_content(
-            model=model,
-            contents=f"Search for: {query}\n\nProvide the top {num_results} most relevant results with titles, URLs, and summaries.",
-            config=types.GenerateContentConfig(
-                tools=[Tool(google_search=GoogleSearch())],
-                temperature=0.1,  # More focused for search
-            ),
-        )
+    # Single stateless API call with Google Search tool
+    response = client.models.generate_content(
+        model=model,
+        contents=f"Search for: {query}\n\nProvide the top {num_results} most relevant results with titles, URLs, and summaries.",
+        config=types.GenerateContentConfig(
+            tools=[Tool(google_search=GoogleSearch())],
+            temperature=0.1,
+        ),
+    )
 
-        # Extract text response
-        if response.candidates and response.candidates[0].content.parts:
-            result_text = ""
-            for part in response.candidates[0].content.parts:
-                if hasattr(part, "text"):
-                    result_text += part.text
-            return result_text.strip() or "No results returned."
+    # Extract text response
+    if response.candidates and response.candidates[0].content.parts:
+        result_text = ""
+        for part in response.candidates[0].content.parts:
+            if hasattr(part, "text"):
+                result_text += part.text
+        return result_text.strip() or "No results returned."
 
-        return "No results returned."
-
-    except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
-        _record_503()
-        logging.warning(f"Search request failed with {type(e).__name__}: {e}")
-        raise
-    except Exception as e:
-        # Don't retry on other exceptions (auth errors, invalid requests, etc.)
-        return f"Error performing search: {e}"
+    return "No results returned."
 
 
 @GEMINI_RETRY_DECORATOR
 def _gemini_code_exec(
     code: str,
-    model: str = "gemini-2.0-flash",
+    model: str = MODEL_CODE_EXEC,
 ) -> str:
-    """
-    Internal implementation of code execution with automatic retry on 503/429.
+    """Internal implementation of code execution with automatic retry."""
+    client = get_client()
 
-    Note: Code execution service can be more resource-constrained than
-    general text generation, so transient 503 errors are more common.
-    """
-    _check_503_cooldown()
-    try:
-        client = get_client()
+    # Single stateless API call with Code Execution tool
+    response = client.models.generate_content(
+        model=model,
+        contents=f"Execute this Python code and show the output:\n\n```python\n{code}\n```",
+        config=types.GenerateContentConfig(
+            tools=[Tool(code_execution=ToolCodeExecution())],
+            temperature=0,
+        ),
+    )
 
-        # Single stateless API call with Code Execution tool
-        response = client.models.generate_content(
-            model=model,
-            contents=f"Execute this Python code and show the output:\n\n```python\n{code}\n```",
-            config=types.GenerateContentConfig(
-                tools=[Tool(code_execution=ToolCodeExecution())],
-                temperature=0,  # Deterministic for code execution
-            ),
-        )
+    # Extract execution results
+    if response.candidates and response.candidates[0].content.parts:
+        result_text = ""
+        for part in response.candidates[0].content.parts:
+            if hasattr(part, "text"):
+                result_text += part.text
+            elif hasattr(part, "executable_code"):
+                result_text += f"Executed:\n{part.executable_code.code}\n"
+            elif hasattr(part, "code_execution_result"):
+                result_text += f"Output:\n{part.code_execution_result.output}\n"
 
-        # Extract execution results
-        if response.candidates and response.candidates[0].content.parts:
-            result_text = ""
-            for part in response.candidates[0].content.parts:
-                # Code execution results come in executable_code or code_execution_result
-                if hasattr(part, "text"):
-                    result_text += part.text
-                elif hasattr(part, "executable_code"):
-                    result_text += f"Executed:\n{part.executable_code.code}\n"
-                elif hasattr(part, "code_execution_result"):
-                    result_text += f"Output:\n{part.code_execution_result.output}\n"
+        return result_text.strip() or "Code executed (no output)."
 
-            return result_text.strip() or "Code executed (no output)."
+    return "Code executed (no output)."
 
-        return "Code executed (no output)."
-
-    except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
-        _record_503()
-        logging.warning(f"Code execution request failed with {type(e).__name__}: {e}")
-        raise
-    except Exception as e:
-        # Don't retry on other exceptions
-        return f"Error executing code: {e}"
 
 def _consult(
     query: str,
@@ -500,32 +461,26 @@ def _consult(
 
     parts.append(types.Part.from_text(text=query))
 
-    # Apply retry logic to the send_message call
-    max_retries = 5
-    last_exception = None
+    # Get the per-session lock for thread-safe send_message
+    with sessions_lock:
+        if session_id not in session_locks:
+            session_locks[session_id] = threading.Lock()
+        lock = session_locks[session_id]
 
-    for attempt in range(max_retries):
-        _check_503_cooldown()  # Respect cooldown from recent 503s
+    # Hold lock during send to prevent concurrent access to same session
+    with lock:
         try:
-            return session.send_message(parts, config=gen_config).text
+            return _send_with_retry(session, parts, gen_config)
         except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
-            _record_503()  # Track for cooldown
-            last_exception = e
-            if attempt < max_retries - 1:
-                # Exponential backoff: 2, 4, 8, 16, 32s (capped at 60)
-                wait_time = min(2 ** (attempt + 1), 60)
-                logging.warning(
-                    f"Consult attempt {attempt + 1}/{max_retries} failed: {e}. "
-                    f"Retrying in {wait_time}s..."
-                )
-                time.sleep(wait_time)
-            else:
-                logging.error(f"All {max_retries} consult attempts failed: {e}")
+            return f"Error: Service temporarily unavailable after retries: {e}"
         except Exception as e:
-            # Don't retry on non-transient errors
             return f"Error: {e}"
 
-    return f"Error: Service temporarily unavailable after {max_retries} attempts: {last_exception}"
+
+@GEMINI_RETRY_DECORATOR
+def _send_with_retry(session: Any, parts: list[types.Part], config: types.GenerateContentConfig) -> str:
+    """Send message with automatic retry on transient errors."""
+    return session.send_message(parts, config=config).text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -537,11 +492,11 @@ def _consult(
 def gemini_search(
     query: str,
     num_results: int = 5,
-    model: str = "gemini-3-flash-preview",
+    model: str = MODEL_SEARCH,
 ) -> str:
     """
     Search the web using Gemini's built-in Google Search.
-    
+
     Returns formatted search results (titles, URLs, snippets).
     Stateless utility.
     """
@@ -551,11 +506,11 @@ def gemini_search(
 @mcp.tool()
 def gemini_code_exec(
     code: str,
-    model: str = "gemini-3-flash-preview",
+    model: str = MODEL_CODE_EXEC,
 ) -> str:
     """
     Execute Python code using Gemini's built-in code execution sandbox.
-    
+
     Returns stdout, stderr, and any execution results.
     Stateless utility.
     """
@@ -650,11 +605,15 @@ def rebuild_index(path: str = ".") -> str:
 
 @mcp.tool()
 def generate_image(prompt: str, output_path: str) -> str:
-    """Generates an image using Imagen 3 models."""
+    """Generates an image using Imagen models."""
     client = get_client()
     try:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        response = client.models.generate_images(model="imagen-4.0-generate-001", prompt=prompt, config=types.GenerateImagesConfig(number_of_images=1))
+        response = client.models.generate_images(
+            model=MODEL_IMAGE,
+            prompt=prompt,
+            config=types.GenerateImagesConfig(number_of_images=1),
+        )
         if response.generated_images:
             Path(output_path).write_bytes(response.generated_images[0].image.image_bytes)
             return f"Image generated and saved to {output_path}"
@@ -670,12 +629,18 @@ def generate_speech(text: str, output_path: str, voice_name: str = "Puck") -> st
     try:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         response = client.models.generate_content(
-            model="gemini-2.5-flash-preview-tts",
+            model=MODEL_SPEECH,
             contents=text,
             config=types.GenerateContentConfig(
                 response_modalities=["AUDIO"],
-                speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)))
-            )
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=voice_name
+                        )
+                    )
+                ),
+            ),
         )
         audio_bytes = b""
         if response.candidates:
