@@ -17,4 +17,4 @@ wheels/
 .vscode/
 
 # gpal specific
-.gpal-api-key
+.gpal-api-key.gemini/
