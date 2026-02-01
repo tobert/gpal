@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Union
 
 import chromadb
 import pathspec
@@ -474,12 +476,54 @@ class CodebaseIndex:
         self._update_file_metadata(path, len(chunks))
         return rel_path
 
+    # Type alias for progress callbacks (sync or async)
+    ProgressCallback = Union[
+        Callable[[str, int, int], Awaitable[None]],  # async with (message, current, total)
+        Callable[[str], None],  # sync with just message
+    ]
+
+    async def _notify_progress(
+        self,
+        callback: ProgressCallback | None,
+        message: str,
+        current: int = 0,
+        total: int = 0,
+    ) -> None:
+        """
+        Call progress callback, handling both sync and async variants.
+
+        Introspects the callback signature to determine how many arguments it accepts.
+
+        Args:
+            callback: The progress callback (sync or async), or None.
+            message: Progress message.
+            current: Current item number (for 3-arg callbacks).
+            total: Total items (for 3-arg callbacks).
+        """
+        if callback is None:
+            return
+
+        # Introspect signature to determine argument count
+        sig = inspect.signature(callback)
+        params_count = len(sig.parameters)
+
+        if asyncio.iscoroutinefunction(callback):
+            if params_count >= 3:
+                await callback(message, current, total)
+            else:
+                await callback(message)  # type: ignore[call-arg]
+        else:
+            if params_count >= 3:
+                callback(message, current, total)  # type: ignore[call-arg]
+            else:
+                callback(message)
+
     async def rebuild_async(
         self,
         force: bool = False,
         dry_run: bool = False,
         max_files: int | None = None,
-        progress_callback: Callable[[str], None] | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> dict:
         """
         Rebuild the index asynchronously with concurrent embedding.
@@ -489,6 +533,8 @@ class CodebaseIndex:
             dry_run: If True, count files/chunks without making API calls.
             max_files: Maximum number of files to index (for testing/budget control).
             progress_callback: Optional callback for progress updates.
+                Can be sync (message: str) -> None or
+                async (message: str, current: int, total: int) -> Awaitable[None].
 
         Returns:
             Dict with counts: {"indexed": N, "skipped": M, "removed": K, "chunks": C}
@@ -496,8 +542,7 @@ class CodebaseIndex:
         """
         # Check for embedding dimension mismatch (model change)
         if not force and not dry_run and not self._check_embedding_dimensions():
-            if progress_callback:
-                progress_callback("Embedding model changed, forcing full rebuild...")
+            await self._notify_progress(progress_callback, "Embedding model changed, forcing full rebuild...")
             force = True
 
         if force and not dry_run:
@@ -543,10 +588,10 @@ class CodebaseIndex:
             for path in files_to_index:
                 chunks = self._chunk_file(path)
                 total_chunks += len(chunks)
-            if progress_callback:
-                progress_callback(
-                    f"Dry run: {len(files_to_index)} files, {total_chunks} chunks"
-                )
+            await self._notify_progress(
+                progress_callback,
+                f"Dry run: {len(files_to_index)} files, {total_chunks} chunks",
+            )
             return {
                 "indexed": len(files_to_index),
                 "skipped": skipped,
@@ -555,8 +600,10 @@ class CodebaseIndex:
                 "dry_run": True,
             }
 
-        if progress_callback:
-            progress_callback(f"Indexing {len(files_to_index)} files...")
+        total_files = len(files_to_index)
+        await self._notify_progress(
+            progress_callback, f"Indexing {total_files} files...", 0, total_files
+        )
 
         # Create semaphore for concurrency control
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_EMBEDS)
@@ -571,14 +618,22 @@ class CodebaseIndex:
         # Log any errors
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                if progress_callback:
-                    progress_callback(f"Error indexing {files_to_index[i]}: {result}")
+                await self._notify_progress(
+                    progress_callback,
+                    f"Error indexing {files_to_index[i]}: {result}",
+                    i + 1,
+                    total_files,
+                )
 
         # Remove stale files
         removed = self._remove_stale_files(current_files)
 
-        if progress_callback:
-            progress_callback(f"Done: {indexed} indexed, {skipped} skipped, {removed} removed")
+        await self._notify_progress(
+            progress_callback,
+            f"Done: {indexed} indexed, {skipped} skipped, {removed} removed",
+            total_files,
+            total_files,
+        )
 
         return {"indexed": indexed, "skipped": skipped, "removed": removed}
 

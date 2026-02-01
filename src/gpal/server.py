@@ -7,17 +7,19 @@ autonomous codebase exploration capabilities.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import threading
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import glob as globlib
 from cachetools import TTLCache
 from dotenv import load_dotenv
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from google import genai
 from google.api_core.exceptions import (
     InternalServerError,
@@ -137,6 +139,142 @@ sessions_lock = threading.Lock()
 session_locks: dict[str, threading.Lock] = {}
 uploaded_files: dict[str, types.File] = {}  # Cache for Gemini File API uploads
 _indexes: dict = {}  # Cache for semantic search indexes
+_indexes_lock = threading.Lock()  # Thread safety for _indexes
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MCP Resources
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@mcp.resource("gpal://info")
+def get_server_info() -> str:
+    """Server version, model configuration, and limits."""
+    from gpal import __version__
+
+    info = {
+        "version": __version__,
+        "models": {
+            "flash": MODEL_FLASH,
+            "pro": MODEL_PRO,
+            "search": MODEL_SEARCH,
+            "code_exec": MODEL_CODE_EXEC,
+            "image": MODEL_IMAGE,
+            "speech": MODEL_SPEECH,
+        },
+        "limits": {
+            "max_file_size_mb": MAX_FILE_SIZE // (1024 * 1024),
+            "max_inline_media_mb": MAX_INLINE_MEDIA // (1024 * 1024),
+            "max_search_files": MAX_SEARCH_FILES,
+            "max_search_matches": MAX_SEARCH_MATCHES,
+            "max_tool_calls": MAX_TOOL_CALLS,
+            "session_ttl_seconds": 3600,
+            "max_sessions": 100,
+        },
+    }
+    return json.dumps(info, indent=2)
+
+
+@mcp.resource("gpal://sessions")
+def list_sessions_resource() -> str:
+    """List active session IDs with model and history count."""
+    with sessions_lock:
+        # Clean up stale locks for expired sessions
+        active_ids = set(sessions.keys())
+        stale_locks = [sid for sid in session_locks if sid not in active_ids]
+        for sid in stale_locks:
+            del session_locks[sid]
+
+        session_list = []
+        for session_id, session in sessions.items():
+            model = getattr(session, "_gpal_model", "unknown")
+            # Try _curated_history first, fall back to history
+            history = getattr(session, "_curated_history", getattr(session, "history", []))
+            history_count = len(history) if history else 0
+            session_list.append({
+                "session_id": session_id,
+                "model": model,
+                "history_count": history_count,
+            })
+    return json.dumps(session_list, indent=2)
+
+
+@mcp.resource("gpal://session/{session_id}")
+def get_session_detail(session_id: str) -> str:
+    """View conversation history for a session."""
+    with sessions_lock:
+        if session_id not in sessions:
+            return json.dumps({"error": f"Session '{session_id}' not found"})
+
+        session = sessions[session_id]
+        model = getattr(session, "_gpal_model", "unknown")
+        history = getattr(session, "_curated_history", getattr(session, "history", []))
+
+        # Convert history to serializable format
+        messages = []
+        for item in history or []:
+            try:
+                parts_text = []
+                if hasattr(item, "parts"):
+                    for part in item.parts:
+                        # Handle text parts
+                        if hasattr(part, "text") and part.text:
+                            parts_text.append(part.text[:500])  # Truncate long messages
+                        # Handle function calls
+                        elif hasattr(part, "function_call") and part.function_call:
+                            parts_text.append(f"[Function: {part.function_call.name}]")
+                        # Handle function responses
+                        elif hasattr(part, "function_response") and part.function_response:
+                            parts_text.append(f"[Response: {part.function_response.name}]")
+                        # Handle executable code
+                        elif hasattr(part, "executable_code") and part.executable_code:
+                            parts_text.append("[Code Execution]")
+                        # Handle code execution results
+                        elif hasattr(part, "code_execution_result") and part.code_execution_result:
+                            parts_text.append("[Code Result]")
+
+                if parts_text:
+                    messages.append({
+                        "role": getattr(item, "role", "unknown"),
+                        "content": " ".join(parts_text),
+                    })
+            except Exception as e:
+                logging.warning(f"Error serializing message in session {session_id}: {e}")
+                continue
+
+        return json.dumps({
+            "session_id": session_id,
+            "model": model,
+            "message_count": len(messages),
+            "messages": messages,
+        }, indent=2)
+
+
+@mcp.resource("gpal://index/stats")
+def get_index_stats() -> str:
+    """Semantic index statistics (files, chunks per indexed path)."""
+    # Take snapshot under lock to avoid iteration issues
+    with _indexes_lock:
+        indexes_snapshot = list(_indexes.items())
+
+    if not indexes_snapshot:
+        return json.dumps({"message": "No indexes loaded. Use semantic_search or rebuild_index first."})
+
+    stats = {}
+    for path, index in indexes_snapshot:
+        try:
+            # Get collection stats
+            code_count = index.collection.count()
+            meta_count = index.meta_collection.count()
+            stats[path] = {
+                "chunks": code_count,
+                "files_indexed": meta_count,
+                "db_path": str(index.db_path),
+            }
+        except Exception as e:
+            stats[path] = {"error": str(e)}
+
+    return json.dumps(stats, indent=2)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Codebase Exploration Tools (Local)
@@ -272,9 +410,10 @@ def get_index(root: str = "."):
     from gpal.index import CodebaseIndex  # lazy import
     root_path = Path(root).resolve()
     key = str(root_path)
-    if key not in _indexes:
-        _indexes[key] = CodebaseIndex(root_path, get_client())
-    return _indexes[key]
+    with _indexes_lock:
+        if key not in _indexes:
+            _indexes[key] = CodebaseIndex(root_path, get_client())
+        return _indexes[key]
 
 def create_chat(
     client: genai.Client,
@@ -572,7 +711,7 @@ def gemini_code_exec(
 
 
 @mcp.tool()
-def consult_gemini_flash(
+async def consult_gemini_flash(
     query: str,
     session_id: str = "default",
     file_paths: list[str] | None = None,
@@ -580,20 +719,33 @@ def consult_gemini_flash(
     file_uris: list[str] | None = None,
     json_mode: bool = False,
     response_schema: str | None = None,
+    ctx: Context | None = None,
 ) -> str:
     """
     Consults Gemini 3 Flash (Fast/Efficient) for codebase exploration.
-    
+
     Gemini has autonomous access to: list_directory, read_file, search_project.
     """
-    return _consult(
+    if ctx:
+        await ctx.debug(f"Flash query: session={session_id}, files={len(file_paths or [])}")
+
+    # Offload blocking Gemini API call to thread pool
+    loop = asyncio.get_running_loop()
+    func = partial(
+        _consult,
         query, session_id, "flash", file_paths,
         media_paths, file_uris, json_mode, response_schema
     )
+    result = await loop.run_in_executor(None, func)
+
+    if ctx:
+        await ctx.debug("Flash response received")
+
+    return result
 
 
 @mcp.tool()
-def consult_gemini_pro(
+async def consult_gemini_pro(
     query: str,
     session_id: str = "default",
     file_paths: list[str] | None = None,
@@ -601,16 +753,29 @@ def consult_gemini_pro(
     file_uris: list[str] | None = None,
     json_mode: bool = False,
     response_schema: str | None = None,
+    ctx: Context | None = None,
 ) -> str:
     """
     Consults Gemini 3 Pro (Reasoning/Deep) for deep codebase analysis.
-    
+
     Gemini has autonomous access to: list_directory, read_file, search_project.
     """
-    return _consult(
+    if ctx:
+        await ctx.debug(f"Pro query: session={session_id}, files={len(file_paths or [])}")
+
+    # Offload blocking Gemini API call to thread pool
+    loop = asyncio.get_running_loop()
+    func = partial(
+        _consult,
         query, session_id, "pro", file_paths,
         media_paths, file_uris, json_mode, response_schema
     )
+    result = await loop.run_in_executor(None, func)
+
+    if ctx:
+        await ctx.debug("Pro response received")
+
+    return result
 
 
 @mcp.tool()
@@ -647,13 +812,30 @@ def semantic_search(query: str, limit: int = 5, path: str = ".") -> str:
 
 
 @mcp.tool()
-def rebuild_index(path: str = ".") -> str:
+async def rebuild_index(path: str = ".", ctx: Context | None = None) -> str:
     """Rebuild the semantic search index for a codebase."""
     try:
+        if ctx:
+            await ctx.info(f"Rebuilding semantic index for {path}")
+
         index = get_index(path)
-        result = index.rebuild()
+
+        # Create progress callback that uses MCP Context
+        async def progress_callback(message: str, current: int = 0, total: int = 0) -> None:
+            if ctx:
+                await ctx.info(f"[Index] {message}")
+                if total > 0:
+                    await ctx.report_progress(progress=current, total=total)
+
+        result = await index.rebuild_async(progress_callback=progress_callback)
+
+        if ctx:
+            await ctx.info(f"Index complete: {result.get('indexed', 0)} indexed, {result.get('skipped', 0)} skipped")
+
         return f"Index rebuilt: {result.get('indexed', 0)} indexed, {result.get('skipped', 0)} unchanged."
     except Exception as e:
+        if ctx:
+            await ctx.error(f"Index rebuild failed: {e}")
         return f"Error: {e}"
 
 
