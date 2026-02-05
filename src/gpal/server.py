@@ -53,11 +53,16 @@ MODEL_PRO = "gemini-3-pro-preview"
 MODEL_SEARCH = "gemini-2.0-flash"        # Search/code exec use stable 2.0
 MODEL_CODE_EXEC = "gemini-2.0-flash"
 MODEL_IMAGE = "imagen-4.0-generate-001"
+MODEL_IMAGE_PRO = "gemini-3-pro-image-preview"    # Nano Banana Pro
+MODEL_IMAGE_FLASH = "gemini-2.5-flash-image"       # Nano Banana Flash
 MODEL_SPEECH = "gemini-2.5-flash-preview-tts"
 
 MODEL_ALIASES: dict[str, str] = {
     "flash": MODEL_FLASH,
     "pro": MODEL_PRO,
+    "imagen": MODEL_IMAGE,
+    "nano-pro": MODEL_IMAGE_PRO,
+    "nano-flash": MODEL_IMAGE_FLASH,
 }
 
 # Limits
@@ -160,6 +165,8 @@ def get_server_info() -> str:
             "search": MODEL_SEARCH,
             "code_exec": MODEL_CODE_EXEC,
             "image": MODEL_IMAGE,
+            "image_pro": MODEL_IMAGE_PRO,
+            "image_flash": MODEL_IMAGE_FLASH,
             "speech": MODEL_SPEECH,
         },
         "limits": {
@@ -864,20 +871,119 @@ async def rebuild_index(path: str = ".", ctx: Context | None = None) -> str:
 
 
 @mcp.tool()
-def generate_image(prompt: str, output_path: str) -> str:
-    """Generates an image using Imagen models."""
+def list_models() -> str:
+    """List available Gemini models grouped by capability.
+
+    Queries the Gemini API for all accessible models and groups them
+    by supported actions (generateContent, generateImages, embedContent, etc.).
+    """
     client = get_client()
     try:
+        groups: dict[str, list[str]] = {}
+        for model in client.models.list():
+            name = model.name or "unknown"
+            for action in getattr(model, "supported_actions", None) or []:
+                groups.setdefault(action, []).append(name)
+
+        if not groups:
+            return "No models found."
+
+        lines = []
+        for action in sorted(groups):
+            lines.append(f"## {action}")
+            for name in sorted(groups[action]):
+                lines.append(f"  - {name}")
+            lines.append("")
+        return "\n".join(lines).strip()
+    except Exception as e:
+        return f"Error listing models: {e}"
+
+
+def _generate_image_imagen(
+    client: genai.Client,
+    model: str,
+    prompt: str,
+    aspect_ratio: str | None,
+) -> bytes:
+    """Generate an image via the Imagen generate_images API."""
+    config_kwargs: dict[str, Any] = {"number_of_images": 1}
+    if aspect_ratio:
+        config_kwargs["aspect_ratio"] = aspect_ratio
+    response = client.models.generate_images(
+        model=model,
+        prompt=prompt,
+        config=types.GenerateImagesConfig(**config_kwargs),
+    )
+    if response.generated_images:
+        return response.generated_images[0].image.image_bytes
+    raise ValueError("Imagen returned no images")
+
+
+def _generate_image_nano_banana(
+    client: genai.Client,
+    model: str,
+    prompt: str,
+    aspect_ratio: str | None,
+    image_size: str | None,
+) -> bytes:
+    """Generate an image via Gemini generate_content with IMAGE modality (Nano Banana)."""
+    config_kwargs: dict[str, Any] = {
+        "response_modalities": ["TEXT", "IMAGE"],
+    }
+    image_config_kwargs: dict[str, Any] = {}
+    if aspect_ratio:
+        image_config_kwargs["output_image_aspect_ratio"] = aspect_ratio
+    if image_size:
+        image_config_kwargs["output_image_size"] = image_size
+    if image_config_kwargs:
+        config_kwargs["image_generation_config"] = types.ImageGenerationConfig(**image_config_kwargs)
+
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(**config_kwargs),
+    )
+    if response.candidates:
+        for part in response.candidates[0].content.parts:
+            if part.inline_data and part.inline_data.mime_type.startswith("image/"):
+                return part.inline_data.data
+    raise ValueError("Nano Banana returned no image data")
+
+
+NANO_BANANA_MODELS = {MODEL_IMAGE_PRO, MODEL_IMAGE_FLASH}
+
+
+@mcp.tool()
+def generate_image(
+    prompt: str,
+    output_path: str,
+    model: str = "imagen",
+    aspect_ratio: str | None = None,
+    image_size: str | None = None,
+) -> str:
+    """Generates an image using Imagen or Nano Banana (Gemini image) models.
+
+    Args:
+        prompt: Text description of the image to generate.
+        output_path: File path to save the generated image.
+        model: Model alias or ID. "imagen" (default), "nano-pro", or "nano-flash".
+        aspect_ratio: Aspect ratio (e.g. "1:1", "16:9", "9:16", "4:3", "3:4").
+        image_size: Output size for Nano Banana only (e.g. "1024x1024"). Not supported by Imagen.
+    """
+    client = get_client()
+    resolved = MODEL_ALIASES.get(model.lower(), model)
+    try:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        response = client.models.generate_images(
-            model=MODEL_IMAGE,
-            prompt=prompt,
-            config=types.GenerateImagesConfig(number_of_images=1),
-        )
-        if response.generated_images:
-            Path(output_path).write_bytes(response.generated_images[0].image.image_bytes)
-            return f"Image generated and saved to {output_path}"
-        return "No image generated."
+
+        if resolved in NANO_BANANA_MODELS:
+            image_bytes = _generate_image_nano_banana(client, resolved, prompt, aspect_ratio, image_size)
+        else:
+            if image_size:
+                return f"Error: image_size is only supported by Nano Banana models (nano-pro, nano-flash), not {resolved}"
+            image_bytes = _generate_image_imagen(client, resolved, prompt, aspect_ratio)
+
+        Path(output_path).write_bytes(image_bytes)
+        return f"Image generated ({resolved}) and saved to {output_path}"
     except Exception as e:
         return f"Error: {e}"
 

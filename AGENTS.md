@@ -84,8 +84,21 @@ We always prefer the latest and most capable models available from Google.
 |-------|-------|----------|
 | `gemini-3-flash-preview` | `flash` | Fast exploration, searching, listing |
 | `gemini-3-pro-preview` | `pro` | Deep reasoning, synthesis, code review |
-| `imagen-4.0-generate-001` | `image` | High-fidelity image generation |
+| `imagen-4.0-generate-001` | `imagen` | General purpose image generation |
+| `gemini-3-pro-image-preview` | `nano-pro` | Best quality images, text rendering, 4K |
+| `gemini-2.5-flash-image` | `nano-flash` | Fast, efficient image generation |
 | `gemini-2.5-flash-preview-tts` | `speech` | Text-to-speech synthesis |
+
+### Updating Google Models
+
+Tips for keeping model IDs current:
+
+- Use the `list_models` tool (or `client.models.list()` in the SDK) to discover current models
+- Check https://ai.google.dev/gemini-api/docs/models for the latest model IDs
+- Google's naming: `gemini-{version}-{variant}` for text/multimodal, `imagen-{version}` for image-only
+- **Nano Banana** models use `generate_content` (NOT `generate_images`) — they're Gemini models with image output modality
+- Preview models (`-preview` suffix) may change; GA models have dated suffixes like `-001`
+- When updating: change constants at top of `server.py`, update `MODEL_ALIASES`, update `gpal://info` resource, update this doc
 
 ### Safety Limits
 
