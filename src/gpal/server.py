@@ -114,6 +114,29 @@ MIME_TYPES: dict[str, str] = {
     ".csv": "text/csv",
     ".json": "application/json",
     ".log": "text/plain",
+    ".py": "text/x-python",
+    ".js": "text/javascript",
+    ".ts": "text/plain",
+    ".tsx": "text/plain",
+    ".jsx": "text/plain",
+    ".vue": "text/plain",
+    ".go": "text/plain",
+    ".rs": "text/plain",
+    ".rb": "text/plain",
+    ".java": "text/plain",
+    ".c": "text/plain",
+    ".cpp": "text/plain",
+    ".h": "text/plain",
+    ".hpp": "text/plain",
+    ".lua": "text/plain",
+    ".sh": "text/x-shellscript",
+    ".yaml": "text/yaml",
+    ".yml": "text/yaml",
+    ".toml": "text/plain",
+    ".xml": "application/xml",
+    ".html": "text/html",
+    ".css": "text/css",
+    ".sql": "text/plain",
 }
 
 
@@ -142,7 +165,8 @@ mcp = FastMCP("gpal")
 sessions: TTLCache = TTLCache(maxsize=100, ttl=3600)  # 1 hour TTL
 sessions_lock = threading.Lock()
 session_locks: dict[str, threading.Lock] = {}
-uploaded_files: dict[str, types.File] = {}  # Cache for Gemini File API uploads
+uploaded_files: TTLCache = TTLCache(maxsize=200, ttl=3600)  # 1 hour TTL, matches sessions
+uploaded_files_lock = threading.Lock()
 _indexes: dict = {}  # Cache for semantic search indexes
 _indexes_lock = threading.Lock()  # Thread safety for _indexes
 
@@ -209,11 +233,20 @@ def list_sessions_resource() -> str:
 @mcp.resource("gpal://session/{session_id}")
 def get_session_detail(session_id: str) -> str:
     """View conversation history for a session."""
+    # Acquire global lock briefly to check existence and get per-session lock
     with sessions_lock:
         if session_id not in sessions:
             return json.dumps({"error": f"Session '{session_id}' not found"})
+        if session_id not in session_locks:
+            session_locks[session_id] = threading.Lock()
+        lock = session_locks[session_id]
 
-        session = sessions[session_id]
+    # Hold per-session lock while reading history (prevents racing with send_message)
+    with lock:
+        session = sessions.get(session_id)
+        if not session:
+            return json.dumps({"error": f"Session '{session_id}' expired"})
+
         model = getattr(session, "_gpal_model", "unknown")
         history = getattr(session, "_curated_history", getattr(session, "history", []))
 
@@ -644,6 +677,7 @@ def _consult(
         lock = session_locks[session_id]
 
     # Hold lock during send to prevent concurrent access to same session
+    replacement = None
     with lock:
         try:
             return _send_with_retry(session, parts, gen_config)
@@ -652,29 +686,31 @@ def _consult(
         except Exception as e:
             error_msg = str(e).lower()
             # Detect stale client (httpx: "client is closed", grpc: "client has been closed")
-            if "client" in error_msg and ("closed" in error_msg or "shutdown" in error_msg):
-                logging.warning(f"Session '{session_id}' has stale client, recreating...")
+            if "client" not in error_msg or ("closed" not in error_msg and "shutdown" not in error_msg):
+                return f"Error: {e}"
 
-                # Preserve conversation history from stale session
-                prev_history = getattr(session, "_curated_history", getattr(session, "history", []))
-                prev_model = getattr(session, "_gpal_model", model_alias)
+            logging.warning(f"Session '{session_id}' has stale client, recreating...")
+            prev_history = getattr(session, "_curated_history", getattr(session, "history", []))
+            prev_model = getattr(session, "_gpal_model", model_alias)
 
-                try:
-                    # Manually recreate session (avoid get_session to prevent lock replacement)
-                    new_client = get_client()
-                    target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
-                    new_session = create_chat(new_client, target_model, history=prev_history, config=gen_config)
-                    new_session._gpal_model = prev_model
+            try:
+                new_client = get_client()
+                target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
+                replacement = create_chat(new_client, target_model, history=prev_history, config=gen_config)
+                replacement._gpal_model = prev_model
+            except Exception as retry_e:
+                return f"Error after retry: {retry_e}"
 
-                    # Update cache while holding session lock (prevents concurrent access)
-                    # Only acquire sessions_lock briefly for dict update
-                    with sessions_lock:
-                        sessions[session_id] = new_session
-
-                    return _send_with_retry(new_session, parts, gen_config)
-                except Exception as retry_e:
-                    return f"Error after retry: {retry_e}"
-            return f"Error: {e}"
+    # Update session cache outside per-session lock to maintain lock hierarchy
+    # (global lock is always acquired before per-session lock)
+    with sessions_lock:
+        sessions[session_id] = replacement
+        session_locks[session_id] = lock  # Ensure our lock stays registered
+    with lock:
+        try:
+            return _send_with_retry(replacement, parts, gen_config)
+        except Exception as retry_e:
+            return f"Error after retry: {retry_e}"
 
 
 @GEMINI_RETRY_DECORATOR
@@ -820,7 +856,8 @@ def upload_file(file_path: str, display_name: str | None = None) -> str:
     config = types.UploadFileConfig(display_name=display_name or path.name, mime_type=mime_type)
     try:
         file = client.files.upload(file=str(path), config=config)
-        uploaded_files[file.uri] = file
+        with uploaded_files_lock:
+            uploaded_files[file.uri] = file
         return f"Uploaded: {file.uri}"
     except Exception as e:
         return f"Error: {e}"
@@ -932,11 +969,11 @@ def _generate_image_nano_banana(
     }
     image_config_kwargs: dict[str, Any] = {}
     if aspect_ratio:
-        image_config_kwargs["output_image_aspect_ratio"] = aspect_ratio
+        image_config_kwargs["aspect_ratio"] = aspect_ratio
     if image_size:
-        image_config_kwargs["output_image_size"] = image_size
+        image_config_kwargs["image_size"] = image_size
     if image_config_kwargs:
-        config_kwargs["image_generation_config"] = types.ImageGenerationConfig(**image_config_kwargs)
+        config_kwargs["image_config"] = types.ImageConfig(**image_config_kwargs)
 
     response = client.models.generate_content(
         model=model,
