@@ -664,9 +664,25 @@ def _consult(
         except Exception as e:
             return f"Error reading media '{path}': {e}"
 
-    # Context: File URIs
+    # Context: File URIs (from upload_file or Gemini Files API)
     for uri in file_uris or []:
-        parts.append(types.Part.from_uri(file_uri=uri))
+        mime = None
+        # Check local cache first (populated by upload_file)
+        with uploaded_files_lock:
+            cached = uploaded_files.get(uri)
+        if cached and cached.mime_type:
+            mime = cached.mime_type
+        else:
+            # Try the Files API for URIs not in our cache
+            try:
+                # Extract file name from URI: .../files/<id>
+                # client.files.get requires resource name "files/<id>"
+                file_id = uri.rstrip("/").rsplit("/", 1)[-1]
+                file_meta = client.files.get(name=f"files/{file_id}")
+                mime = file_meta.mime_type
+            except Exception:
+                pass  # Fall through — let the SDK try without mime_type
+        parts.append(types.Part.from_uri(file_uri=uri, mime_type=mime))
 
     parts.append(types.Part.from_text(text=query))
 
