@@ -89,6 +89,19 @@ We always prefer the latest and most capable models available from Google.
 | `gemini-2.5-flash-image` | `nano-flash` | Fast, efficient image generation |
 | `gemini-2.5-flash-preview-tts` | `speech` | Text-to-speech synthesis |
 
+> **Note**: There is no separate "deep think" model. Gemini thinking mode is enabled via
+> `ThinkingConfig(thinking_level="HIGH")` on Pro. The `consult_gemini_deep_think` tool was
+> removed in v0.2.0 — use `consult_gemini_pro` instead.
+
+### FastMCP Version Pin
+
+FastMCP 2.14.5 has a regression that breaks all async tool functions (`object NoneType can't
+be used in 'await' expression`). Pinned to `>=2.14.4,<2.14.5` in pyproject.toml.
+Remove the pin when the upstream fix is released.
+
+Also note: `ctx.debug/info/warning/error/report_progress` are **async** in FastMCP 2.14 and
+must be `await`ed. `ctx.set_state/get_state` are **sync**.
+
 ### Updating Google Models
 
 Tips for keeping model IDs current:
