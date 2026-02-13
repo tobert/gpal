@@ -61,6 +61,7 @@ gpal/
 │   └── server.py         # MCP server + all logic
 ├── tests/
 │   ├── test_tools.py     # Unit tests (pytest)
+│   ├── test_server.py    # Integration tests (FastMCP Client, in-process)
 │   ├── test_index.py     # Index unit tests
 │   ├── test_agentic.py   # Manual: autonomous exploration
 │   ├── test_connectivity.py  # Manual: API ping
@@ -84,6 +85,7 @@ We always prefer the latest and most capable models available from Google.
 |-------|-------|----------|
 | `gemini-3-flash-preview` | `flash` | Fast exploration, searching, listing |
 | `gemini-3-pro-preview` | `pro` | Deep reasoning, synthesis, code review |
+| `gemini-flash-latest` | — | Web search, code execution (auto-updates) |
 | `imagen-4.0-generate-001` | `imagen` | General purpose image generation |
 | `gemini-3-pro-image-preview` | `nano-pro` | Best quality images, text rendering, 4K |
 | `gemini-2.5-flash-image` | `nano-flash` | Fast, efficient image generation |

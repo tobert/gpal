@@ -64,8 +64,8 @@ logging.basicConfig(
 # Model versions (centralized for easy updates)
 MODEL_FLASH = "gemini-3-flash-preview"
 MODEL_PRO = "gemini-3-pro-preview"
-MODEL_SEARCH = "gemini-2.0-flash-001"        # Stable 2.0
-MODEL_CODE_EXEC = "gemini-2.0-flash-001"
+MODEL_SEARCH = "gemini-flash-latest"          # Auto-updates to latest stable Flash
+MODEL_CODE_EXEC = "gemini-flash-latest"
 MODEL_IMAGE = "imagen-4.0-generate-001"
 MODEL_IMAGE_PRO = "gemini-3-pro-image-preview"    # Nano Banana Pro
 MODEL_IMAGE_FLASH = "gemini-2.5-flash-image"       # Nano Banana Flash
@@ -340,6 +340,51 @@ def list_context_caches_resource() -> str:
     except Exception as e:
         return json.dumps({"error": str(e)})
     return json.dumps(caches, indent=2)
+
+
+@mcp.resource("gpal://models/check")
+def check_model_freshness() -> str:
+    """Compare configured models against available models from the API.
+
+    Lists each configured model, whether it exists in the API, and flags
+    any -latest aliases that have resolved to newer versions.
+    """
+    configured = {
+        "flash": MODEL_FLASH,
+        "pro": MODEL_PRO,
+        "search": MODEL_SEARCH,
+        "code_exec": MODEL_CODE_EXEC,
+        "image": MODEL_IMAGE,
+        "image_pro": MODEL_IMAGE_PRO,
+        "image_flash": MODEL_IMAGE_FLASH,
+        "speech": MODEL_SPEECH,
+    }
+
+    try:
+        client = get_client()
+        available = {}
+        for m in client.models.list():
+            name = (m.name or "").removeprefix("models/")
+            available[name] = m
+    except Exception as e:
+        return json.dumps({"error": f"Could not list models: {e}"})
+
+    results = []
+    for alias, model_id in configured.items():
+        entry = {"alias": alias, "configured": model_id}
+        if model_id in available:
+            entry["status"] = "ok"
+            model_obj = available[model_id]
+            # Check if there's a display name or version hint
+            if model_obj.display_name:
+                entry["display_name"] = model_obj.display_name
+        else:
+            # Might be a -latest alias that resolves server-side
+            entry["status"] = "not_listed" if "-latest" not in model_id else "alias"
+        results.append(entry)
+
+    return json.dumps({"models": results}, indent=2)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Codebase Exploration Tools (Local)
