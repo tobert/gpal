@@ -1,6 +1,6 @@
 [project]
 name = "gpal"
-version = "0.2.0"
+version = "0.3.0"
 description = "An MCP server providing stateful Gemini access with autonomous codebase exploration"
 readme = "README.md"
 license = "MIT"
@@ -17,7 +17,7 @@ classifiers = [
 
 dependencies = [
     "chromadb>=1.4.1",
-    "fastmcp>=2.14.4,<2.14.5",
+    "fastmcp>=3.0.0rc1",
     "fastapi>=0.115.0",
     "google-api-core>=2.29.0",
     "google-genai>=1.63.0",

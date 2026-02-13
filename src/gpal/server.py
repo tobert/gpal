@@ -975,7 +975,7 @@ def semantic_search(query: str, limit: int = 5, path: str = ".") -> str:
         return f"Error: {e}"
 
 
-@mcp.tool(task=True)
+@mcp.tool()
 async def rebuild_index(path: str = ".", ctx: Context | None = None) -> str:
     """Rebuild the semantic search index for a codebase."""
     try:

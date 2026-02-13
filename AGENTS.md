@@ -93,14 +93,14 @@ We always prefer the latest and most capable models available from Google.
 > `ThinkingConfig(thinking_level="HIGH")` on Pro. The `consult_gemini_deep_think` tool was
 > removed in v0.2.0 — use `consult_gemini_pro` instead.
 
-### FastMCP Version Pin
+### FastMCP Version
 
-FastMCP 2.14.5 has a regression that breaks all async tool functions (`object NoneType can't
-be used in 'await' expression`). Pinned to `>=2.14.4,<2.14.5` in pyproject.toml.
-Remove the pin when the upstream fix is released.
+Using FastMCP 3.0.0rc1+. Upgraded from 2.14.x which had a regression in 2.14.5 breaking
+async tool functions. The 3.x upgrade was clean — only required dropping `task=True` from
+`rebuild_index` (background tasks now need `fastmcp[tasks]` extra).
 
-Also note: `ctx.debug/info/warning/error/report_progress` are **async** in FastMCP 2.14 and
-must be `await`ed. `ctx.set_state/get_state` are **sync**.
+`ctx.debug/info/warning/error/report_progress` are **async** — must be `await`ed.
+`ctx.set_state/get_state` are **sync**.
 
 ### Updating Google Models
 
