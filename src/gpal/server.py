@@ -544,7 +544,7 @@ async def get_session(
             session._gpal_model = target_model
             lock = threading.Lock()
             sessions[session_id] = (session, lock)
-            await ctx.set_state("model", target_model)
+            ctx.set_state("model", target_model)
             return session, lock
 
     # Use per-session lock for migration
@@ -564,7 +564,7 @@ async def get_session(
         session._gpal_model = target_model
         with sessions_lock:
             sessions[session_id] = (session, lock)
-        await ctx.set_state("model", target_model)
+        ctx.set_state("model", target_model)
         return session, lock
 
 
@@ -863,7 +863,7 @@ async def consult_gemini_flash(
     Gemini has autonomous access to: list_directory, read_file, search_project.
     """
     if ctx:
-        await ctx.debug(f"Flash query: session={ctx.session_id}, files={len(file_paths or [])}")
+        ctx.debug(f"Flash query: session={ctx.session_id}, files={len(file_paths or [])}")
 
     return await _consult(
         query, ctx, "flash", file_paths,
@@ -888,7 +888,7 @@ async def consult_gemini_pro(
     Gemini has autonomous access to: list_directory, read_file, search_project.
     """
     if ctx:
-        await ctx.debug(f"Pro query: session={ctx.session_id}, files={len(file_paths or [])}")
+        ctx.debug(f"Pro query: session={ctx.session_id}, files={len(file_paths or [])}")
 
     return await _consult(
         query, ctx, "pro", file_paths,
@@ -913,7 +913,7 @@ async def consult_gemini_deep_think(
     Gemini has autonomous access to: list_directory, read_file, search_project.
     """
     if ctx:
-        await ctx.debug(f"Deep Think query: session={ctx.session_id}, files={len(file_paths or [])}")
+        ctx.debug(f"Deep Think query: session={ctx.session_id}, files={len(file_paths or [])}")
 
     return await _consult(
         query, ctx, "deep-think", file_paths,
@@ -1008,26 +1008,26 @@ async def rebuild_index(path: str = ".", ctx: Context | None = None) -> str:
     """Rebuild the semantic search index for a codebase."""
     try:
         if ctx:
-            await ctx.info(f"Rebuilding semantic index for {path}")
+            ctx.info(f"Rebuilding semantic index for {path}")
 
         index = get_index(path)
 
         # Create progress callback that uses MCP Context
         async def progress_callback(message: str, current: int = 0, total: int = 0) -> None:
             if ctx:
-                await ctx.info(f"[Index] {message}")
+                ctx.info(f"[Index] {message}")
                 if total > 0:
-                    await ctx.report_progress(progress=current, total=total)
+                    ctx.report_progress(progress=current, total=total)
 
         result = await index.rebuild_async(progress_callback=progress_callback)
 
         if ctx:
-            await ctx.info(f"Index complete: {result.get('indexed', 0)} indexed, {result.get('skipped', 0)} skipped")
+            ctx.info(f"Index complete: {result.get('indexed', 0)} indexed, {result.get('skipped', 0)} skipped")
 
         return f"Index rebuilt: {result.get('indexed', 0)} indexed, {result.get('skipped', 0)} unchanged."
     except Exception as e:
         if ctx:
-            await ctx.error(f"Index rebuild failed: {e}")
+            ctx.error(f"Index rebuild failed: {e}")
         return f"Error: {e}"
 
 
