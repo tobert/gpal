@@ -1,5 +1,5 @@
 """
-gpal - Gemini Principal Assistant Layer
+gpal - Your Pal Gemini
 
 An MCP server providing stateful access to Google Gemini models with
 autonomous codebase exploration capabilities.
@@ -1232,7 +1232,7 @@ def setup_otel(endpoint: str | None = None) -> None:
 
 def main() -> None:
     global _cli_key_file
-    parser = argparse.ArgumentParser(description="gpal - Gemini Principal Assistant Layer")
+    parser = argparse.ArgumentParser(description="gpal - Your Pal Gemini")
     parser.add_argument("--otel-endpoint", help="OTLP gRPC endpoint (e.g., localhost:4317)")
     parser.add_argument(
         "--api-key-file",

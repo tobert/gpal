@@ -1,5 +1,5 @@
 """
-gpal - Gemini Principal Assistant Layer
+gpal - Your Pal Gemini
 
 An MCP server providing stateful access to Google Gemini models with
 autonomous codebase exploration capabilities.
