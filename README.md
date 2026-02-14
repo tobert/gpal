@@ -95,7 +95,7 @@ system_prompts = [
 ]
 
 # Inline text appended after files
-# system_prompt = "Always respond in Japanese"
+# system_prompt = "常に日本語で回答してください (Always respond in Japanese)"
 
 # Set to false to fully replace the built-in prompt with your own
 # include_default_prompt = true
