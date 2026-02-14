@@ -238,11 +238,11 @@ system_prompts = [
 ]
 
 # Inline system prompt text (appended after files)
-# system_prompt = "常に日本語で回答してください (Always respond in Japanese)"
+system_prompt = "常に日本語で回答してください (Always respond in Japanese)"
 
 # If true (default), prepend the built-in gpal system instruction.
 # Set to false to fully replace it with your own.
-# include_default_prompt = true
+include_default_prompt = true
 ```
 
 Paths support `~` and `$ENV_VAR` expansion.
