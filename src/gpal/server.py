@@ -66,15 +66,17 @@ MODEL_FLASH = "gemini-3-flash-preview"
 MODEL_PRO = "gemini-3-pro-preview"
 MODEL_SEARCH = "gemini-flash-latest"          # Auto-updates to latest stable Flash
 MODEL_CODE_EXEC = "gemini-flash-latest"
-MODEL_IMAGE = "imagen-4.0-generate-001"
-MODEL_IMAGE_PRO = "gemini-3-pro-image-preview"    # Nano Banana Pro
+MODEL_IMAGE = "imagen-4.0-ultra-generate-001"
+MODEL_IMAGE_FAST = "imagen-4.0-fast-generate-001"
+MODEL_IMAGE_PRO = "nano-banana-pro-preview"        # Nano Banana Pro
 MODEL_IMAGE_FLASH = "gemini-2.5-flash-image"       # Nano Banana Flash
-MODEL_SPEECH = "gemini-2.5-flash-preview-tts"
+MODEL_SPEECH = "gemini-2.5-pro-preview-tts"
 
 MODEL_ALIASES: dict[str, str] = {
     "flash": MODEL_FLASH,
     "pro": MODEL_PRO,
     "imagen": MODEL_IMAGE,
+    "imagen-fast": MODEL_IMAGE_FAST,
     "nano-pro": MODEL_IMAGE_PRO,
     "nano-flash": MODEL_IMAGE_FLASH,
 }
@@ -207,6 +209,7 @@ def get_server_info() -> str:
             "search": MODEL_SEARCH,
             "code_exec": MODEL_CODE_EXEC,
             "image": MODEL_IMAGE,
+            "image_fast": MODEL_IMAGE_FAST,
             "image_pro": MODEL_IMAGE_PRO,
             "image_flash": MODEL_IMAGE_FLASH,
             "speech": MODEL_SPEECH,
@@ -355,6 +358,7 @@ def check_model_freshness() -> str:
         "search": MODEL_SEARCH,
         "code_exec": MODEL_CODE_EXEC,
         "image": MODEL_IMAGE,
+        "image_fast": MODEL_IMAGE_FAST,
         "image_pro": MODEL_IMAGE_PRO,
         "image_flash": MODEL_IMAGE_FLASH,
         "speech": MODEL_SPEECH,
@@ -1176,7 +1180,7 @@ def _generate_image_nano_banana(
     raise ValueError("Nano Banana returned no candidates (possible safety filter)")
 
 
-NANO_BANANA_MODELS = {MODEL_IMAGE_PRO, MODEL_IMAGE_FLASH}
+NANO_BANANA_MODELS = {MODEL_IMAGE_PRO, MODEL_IMAGE_FLASH, "gemini-3-pro-image-preview"}
 
 
 @mcp.tool()
@@ -1192,7 +1196,7 @@ def generate_image(
     Args:
         prompt: Text description of the image to generate.
         output_path: File path to save the generated image.
-        model: Model alias or ID. "imagen" (default), "nano-pro", or "nano-flash".
+        model: Model alias or ID. "imagen" (default, ultra), "imagen-fast", "nano-pro", or "nano-flash".
         aspect_ratio: Aspect ratio (e.g. "1:1", "16:9", "9:16", "4:3", "3:4").
         image_size: Output size for Nano Banana only (e.g. "1024x1024"). Not supported by Imagen.
     """

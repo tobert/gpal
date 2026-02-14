@@ -15,10 +15,11 @@ MODEL_FLASH = "gemini-3-flash-preview"
 MODEL_PRO = "gemini-3-pro-preview"
 MODEL_SEARCH = "gemini-flash-latest"
 MODEL_CODE_EXEC = "gemini-flash-latest"
-MODEL_IMAGE = "imagen-4.0-generate-001"
-MODEL_IMAGE_PRO = "gemini-3-pro-image-preview"
+MODEL_IMAGE = "imagen-4.0-ultra-generate-001"
+MODEL_IMAGE_FAST = "imagen-4.0-fast-generate-001"
+MODEL_IMAGE_PRO = "nano-banana-pro-preview"
 MODEL_IMAGE_FLASH = "gemini-2.5-flash-image"
-MODEL_SPEECH = "gemini-2.5-flash-preview-tts"
+MODEL_SPEECH = "gemini-2.5-pro-preview-tts"
 ```
 
 ### 2. `src/gpal/server.py` — `MODEL_ALIASES` dict
@@ -55,7 +56,8 @@ Always bump the version when changing models. Both files must match.
 | `gemini-{N}-{variant}-preview` | Preview model, may change | `gemini-3-flash-preview` |
 | `gemini-{N}.{M}-{variant}-{suffix}` | Dated/versioned GA | `gemini-2.5-flash-image` |
 | `gemini-{variant}-latest` | Auto-updating alias | `gemini-flash-latest` |
-| `imagen-{N}.{M}-generate-{suffix}` | Imagen (image-only) | `imagen-4.0-generate-001` |
+| `imagen-{N}.{M}-{tier}-generate-{suffix}` | Imagen (image-only) | `imagen-4.0-ultra-generate-001` |
+| `nano-banana-{variant}-preview` | Nano Banana (generateContent) | `nano-banana-pro-preview` |
 
 ## When to Use `-latest` Aliases
 

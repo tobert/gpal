@@ -86,10 +86,11 @@ We always prefer the latest and most capable models available from Google.
 | `gemini-3-flash-preview` | `flash` | Fast exploration, searching, listing |
 | `gemini-3-pro-preview` | `pro` | Deep reasoning, synthesis, code review |
 | `gemini-flash-latest` | — | Web search, code execution (auto-updates) |
-| `imagen-4.0-generate-001` | `imagen` | General purpose image generation |
-| `gemini-3-pro-image-preview` | `nano-pro` | Best quality images, text rendering, 4K |
+| `imagen-4.0-ultra-generate-001` | `imagen` | Ultra quality image generation (default) |
+| `imagen-4.0-fast-generate-001` | `imagen-fast` | Fast image generation |
+| `nano-banana-pro-preview` | `nano-pro` | Best quality images, text rendering, 4K |
 | `gemini-2.5-flash-image` | `nano-flash` | Fast, efficient image generation |
-| `gemini-2.5-flash-preview-tts` | `speech` | Text-to-speech synthesis |
+| `gemini-2.5-pro-preview-tts` | `speech` | Text-to-speech synthesis (Pro quality) |
 
 > **Note**: There is no separate "deep think" model. Gemini thinking mode is enabled via
 > `ThinkingConfig(thinking_level="HIGH")` on Pro. The `consult_gemini_deep_think` tool was
