@@ -50,6 +50,7 @@ from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExport
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 from fastmcp.tools.tool import ToolResult
+from gpal.git_tools import git
 
 load_dotenv()
 
@@ -169,6 +170,7 @@ usually in git repositories.
 
 You have tools:
 - list_directory, read_file, search_project — explore the local codebase
+- git — read-only git operations (status, diff, log, show)
 - gemini_search — search the web via Google Search
 - semantic_search — find code by meaning using vector embeddings
 
@@ -678,7 +680,7 @@ def create_chat(
     if config is None:
         config = types.GenerateContentConfig(
             temperature=0.2,
-            tools=[list_directory, read_file, search_project],
+            tools=[list_directory, read_file, search_project, git],
             automatic_function_calling=types.AutomaticFunctionCallingConfig(
                 disable=False,
                 maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
@@ -842,7 +844,7 @@ async def _consult(
         # Build generation config
         config_kwargs = {
             "temperature": 0.2,
-            "tools": [list_directory, read_file, search_project, gemini_search, semantic_search],
+            "tools": [list_directory, read_file, search_project, gemini_search, semantic_search, git],
             "automatic_function_calling": types.AutomaticFunctionCallingConfig(
                 disable=False,
                 maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
