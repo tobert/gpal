@@ -7,8 +7,9 @@ Internal documentation for gpal development.
 Before committing changes to gpal, use gpal to review them:
 
 ```
-consult_gemini_pro(
+consult_gemini(
     query="Review server.py for bugs, edge cases, and API misuse",
+    model="pro",
     file_paths=["src/gpal/server.py"]
 )
 ```
@@ -28,7 +29,7 @@ Gemini catches real issues — see git history for proof.
 │                 gpal Server                         │
 │                                                     │
 │  ┌─────────────────┐  ┌─────────────────┐          │
-│  │ consult_flash   │  │ consult_pro     │  ← Tools │
+│  │ consult_gemini  │  │ consult_oneshot │  ← Tools │
 │  └────────┬────────┘  └────────┬────────┘          │
 │           │                    │                    │
 │           └──────────┬─────────┘                    │
@@ -93,8 +94,7 @@ We always prefer the latest and most capable models available from Google.
 | `gemini-2.5-pro-preview-tts` | `speech` | Text-to-speech synthesis (Pro quality) |
 
 > **Note**: There is no separate "deep think" model. Gemini thinking mode is enabled via
-> `ThinkingConfig(thinking_level="HIGH")` on Pro. The `consult_gemini_deep_think` tool was
-> removed in v0.2.0 — use `consult_gemini_pro` instead.
+> `ThinkingConfig(thinking_level="HIGH")` on Pro.
 
 ### FastMCP Version
 
@@ -112,8 +112,8 @@ and converts `TimeoutError` to `McpError(-32000)`.
 
 | Tool | Timeout | Rationale |
 |------|---------|-----------|
-| `consult_gemini_flash` | 60s | Fast model, 1 min ceiling |
-| `consult_gemini_pro` | 600s | Deep reasoning with tool calls |
+| `consult_gemini` | 660s | Unified tool (auto mode: Flash explore + Pro synthesize) |
+| `consult_gemini_oneshot` | 120s | Stateless single-shot queries |
 | `rebuild_index` | 300s | Large index rebuilds |
 | All others | None | Quick sync operations |
 
@@ -128,6 +128,24 @@ FastMCP 3.0 handles distributed trace context automatically via `inject_trace_co
 `tools/call` span. The `setup_otel()` function is kept — it configures the OTel SDK
 (TracerProvider + OTLP exporter) that makes FastMCP's built-in instrumentation actually export.
 
+### `consult_gemini` Tool
+
+Single unified tool for all Gemini consultations:
+
+- **`model="auto"`** (default): Flash explores the codebase autonomously (cheap, fast), then Pro synthesizes findings. Uses session history migration — same session ID, Flash history flows to Pro automatically.
+- **`model="flash"`** or **`model="pro"`**: Direct pass-through to a specific model.
+- **`consult_gemini_oneshot`**: Separate stateless tool, no session. For independent questions where conversation context is noise.
+
+### Token Tracking & Rate Limiting
+
+Sliding-window token tracker in `server.py`:
+
+- `record_tokens(model, count)` — records usage after each Gemini call
+- `tokens_in_window(model)` — returns tokens consumed in last 60s
+- `token_stats()` — current usage per model (exposed in `gpal://info`)
+- **Proactive throttling**: Before sending, checks if at 90% of TPM limit and sleeps 5s if so
+- Token counts included in `ToolResult.meta` (`prompt_tokens`, `completion_tokens`, `total_tokens`)
+
 ### Updating Google Models
 
 Tips for keeping model IDs current:
@@ -138,6 +156,27 @@ Tips for keeping model IDs current:
 - **Nano Banana** models use `generate_content` (NOT `generate_images`) — they're Gemini models with image output modality
 - Preview models (`-preview` suffix) may change; GA models have dated suffixes like `-001`
 - When updating: change constants at top of `server.py`, update `MODEL_ALIASES`, update `gpal://info` resource, update this doc
+
+### Thread Pool & AFC Safety
+
+**`_EXECUTOR`** — Dedicated `ThreadPoolExecutor(max_workers=16, thread_name_prefix="gpal")`.
+All `run_in_executor` calls use this instead of the default executor to avoid starving the
+event loop's default pool. 16 workers is sufficient since AFC tool calls within one
+`send_message()` are serial, not parallel.
+
+**`_afc_local.in_afc`** — Thread-local flag set to `True` inside `_send_with_retry` around
+`session.send_message()`, cleared in a `finally` block. Functions that check it:
+- `_gemini_search`: skips `_sync_throttle` (outer `_consult` already throttled) and acquires
+  `_afc_api_semaphore` to cap concurrent outbound API calls
+- `semantic_search`: acquires `_afc_api_semaphore` for the same reason
+
+**`_afc_api_semaphore`** — `threading.Semaphore(4)` limiting concurrent outbound Gemini API
+calls from within AFC tool callbacks, preventing connection saturation when multiple sessions
+run concurrently.
+
+**Stdin watchdog** — Background asyncio task (`_stdin_watchdog`) polls `os.fstat()` on stdin
+every 5s. If the fd is invalid (client disconnected/crashed), calls `os._exit(0)`
+to prevent orphaned CPU-spinning processes. Wired via FastMCP's `lifespan=` parameter.
 
 ### Safety Limits
 
