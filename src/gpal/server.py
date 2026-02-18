@@ -12,9 +12,12 @@ import io
 import json
 import logging
 import os
+import sys
 import threading
 import tomllib
 import wave
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -39,7 +42,9 @@ from tenacity import (
     wait_exponential,
 )
 
+import random
 import time
+from dataclasses import dataclass
 
 # OpenTelemetry imports
 from opentelemetry import trace, propagate
@@ -81,6 +86,7 @@ MODEL_ALIASES: dict[str, str] = {
     "imagen-fast": MODEL_IMAGE_FAST,
     "nano-pro": MODEL_IMAGE_PRO,
     "nano-flash": MODEL_IMAGE_FLASH,
+    "speech": MODEL_SPEECH,
 }
 
 # Limits
@@ -101,6 +107,119 @@ GEMINI_RETRY_DECORATOR = retry(
     before_sleep=before_sleep_log(logging.getLogger(__name__), logging.WARNING),
     reraise=True,
 )
+
+# Dedicated thread pool for Gemini API calls (avoids starving the default executor)
+_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="gpal")
+
+# Thread-local flag: True while inside Gemini's automatic function calling loop
+_afc_local = threading.local()
+
+# Semaphore limiting concurrent outbound API calls from AFC tool callbacks
+_afc_api_semaphore = threading.Semaphore(4)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Token Tracking & Rate Limiting
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Published TPM limits (tokens per minute) — conservative defaults
+RATE_LIMITS_TPM: dict[str, int] = {
+    MODEL_PRO: 1_000_000,
+    MODEL_FLASH: 4_000_000,
+    MODEL_SEARCH: 4_000_000,  # Resolves to a Flash model
+    MODEL_SPEECH: 2_000_000,
+    MODEL_IMAGE_PRO: 1_000_000,
+    MODEL_IMAGE_FLASH: 4_000_000,
+}
+
+_KNOWN_MODELS: frozenset[str] = frozenset(
+    set(MODEL_ALIASES.values()) | set(RATE_LIMITS_TPM.keys())
+)
+
+_token_windows: dict[str, list[tuple[float, int]]] = {}  # model -> [(timestamp, tokens)]
+_token_lock = threading.Lock()
+
+
+def record_tokens(model: str, count: int) -> None:
+    """Record token usage for rate limiting.
+
+    Only tracks known models (MODEL_ALIASES values + RATE_LIMITS_TPM keys)
+    to prevent unbounded memory growth from arbitrary model strings.
+    """
+    now = time.monotonic()
+    cutoff = now - 60.0
+    with _token_lock:
+        # Cap to known models to prevent DoS via arbitrary model strings
+        if model not in _KNOWN_MODELS:
+            return
+        window = _token_windows.setdefault(model, [])
+        # Prune expired entries to prevent memory leak
+        if window and window[0][0] < cutoff:
+            _token_windows[model] = window = [(t, c) for t, c in window if t > cutoff]
+        window.append((now, count))
+
+
+def tokens_in_window(model: str, window_secs: float = 60.0) -> int:
+    """Return tokens consumed in the last N seconds."""
+    now = time.monotonic()
+    cutoff = now - window_secs
+    with _token_lock:
+        window = _token_windows.get(model, [])
+        # Prune expired entries
+        _token_windows[model] = window = [(t, c) for t, c in window if t > cutoff]
+        return sum(c for _, c in window)
+
+
+def token_stats() -> dict[str, dict[str, int]]:
+    """Return current token consumption per model (for gpal://info)."""
+    with _token_lock:
+        now = time.monotonic()
+        cutoff = now - 60.0
+        stats = {}
+        for model, window in _token_windows.items():
+            active = [(t, c) for t, c in window if t > cutoff]
+            if active:
+                limit = RATE_LIMITS_TPM.get(model, 0)
+                stats[model] = {
+                    "tokens_last_60s": sum(c for _, c in active),
+                    "limit_tpm": limit,
+                }
+        return stats
+
+
+def _sync_throttle(model: str) -> None:
+    """Block if approaching rate limit. For sync code paths."""
+    limit = RATE_LIMITS_TPM.get(model, 0)
+    while limit > 0:
+        current = tokens_in_window(model)
+        if current <= limit * 0.9:
+            break
+        jitter = random.uniform(1.0, 5.0)
+        logging.warning(f"Rate limit approaching for {model}: {current}/{limit} TPM, sleeping {jitter:.1f}s")
+        time.sleep(jitter)
+
+
+async def _async_throttle(model: str, ctx: Context | None = None) -> None:
+    """Async version of rate limit throttle with re-check after sleep."""
+    limit = RATE_LIMITS_TPM.get(model, 0)
+    while limit > 0:
+        current = tokens_in_window(model)
+        if current <= limit * 0.9:
+            break
+        jitter = random.uniform(1.0, 5.0)
+        logging.warning(f"Rate limit approaching for {model}: {current}/{limit} TPM, sleeping {jitter:.1f}s")
+        if ctx:
+            await ctx.warning(f"Rate limit approaching ({current}/{limit} TPM), throttling...")
+        await asyncio.sleep(jitter)
+
+
+@dataclass
+class GeminiResponse:
+    """Result from _send_with_retry including usage metadata."""
+    text: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
 
 # MIME type mappings for multimodal support
 MIME_TYPES: dict[str, str] = {
@@ -277,7 +396,48 @@ def _build_system_instruction(
 # Server & State
 # ─────────────────────────────────────────────────────────────────────────────
 
-mcp = FastMCP("gpal")
+async def _stdin_watchdog() -> None:
+    """Exit if the MCP client disconnects (stdin fd closed).
+
+    Polls every 5s using os.fstat(). If the fd becomes invalid (client
+    crashed, pipe broken), the server exits cleanly. This prevents orphaned
+    gpal processes from spinning CPU after the client disappears.
+
+    Uses fstat() — not read() — to avoid consuming bytes from the MCP
+    stdio transport stream.
+    """
+    try:
+        fd = sys.stdin.fileno()
+    except (ValueError, io.UnsupportedOperation):
+        logger.warning("stdin has no fileno — watchdog disabled")
+        return
+
+    while True:
+        await asyncio.sleep(5)
+        try:
+            os.fstat(fd)
+        except OSError:
+            logger.info("stdin fd invalid — client disconnected, exiting")
+            os._exit(0)
+
+
+@asynccontextmanager
+async def _gpal_lifespan(app):
+    """FastMCP lifespan: start/cancel the stdin watchdog."""
+    task = asyncio.create_task(_stdin_watchdog())
+    logger.info("stdin watchdog started")
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        logger.info("stdin watchdog stopped")
+
+
+mcp = FastMCP("gpal", lifespan=_gpal_lifespan)
 sessions: TTLCache = TTLCache(maxsize=100, ttl=3600)  # Stores (session, lock)
 sessions_lock = threading.Lock()
 # Note: session_locks dict is removed; locks are now bundled with sessions.
@@ -323,6 +483,7 @@ def get_server_info() -> str:
             "sources": _system_instruction_sources,
             "length_chars": len(_system_instruction),
         },
+        "token_usage": token_stats(),
     }
     return json.dumps(info, indent=2)
 
@@ -748,30 +909,47 @@ def _gemini_search(
     model: str = MODEL_SEARCH,
 ) -> str:
     """Internal implementation of web search with automatic retry."""
+    in_afc = getattr(_afc_local, "in_afc", False)
+    # Skip throttle when called from AFC — the outer _consult already throttled
+    if not in_afc:
+        _sync_throttle(model)
     client = get_client()
 
     # Clamp num_results
     num_results = max(1, min(num_results, MAX_SEARCH_RESULTS))
 
-    # Single stateless API call with Google Search tool
-    response = client.models.generate_content(
-        model=model,
-        contents=f"Search for: {query}\n\nProvide the top {num_results} most relevant results with titles, URLs, and summaries.",
-        config=types.GenerateContentConfig(
-            tools=[Tool(google_search=GoogleSearch())],
-            temperature=0.1,
-        ),
-    )
+    # Cap concurrent outbound API calls when inside AFC
+    if in_afc:
+        _afc_api_semaphore.acquire()
+    try:
+        # Single stateless API call with Google Search tool
+        response = client.models.generate_content(
+            model=model,
+            contents=f"Search for: {query}\n\nProvide the top {num_results} most relevant results with titles, URLs, and summaries.",
+            config=types.GenerateContentConfig(
+                tools=[Tool(google_search=GoogleSearch())],
+                temperature=0.1,
+            ),
+        )
 
-    # Extract text response
-    if response.candidates and response.candidates[0].content.parts:
-        result_text = ""
-        for part in response.candidates[0].content.parts:
-            if hasattr(part, "text"):
-                result_text += part.text
-        return result_text.strip() or "No results returned."
+        # Record token usage
+        usage = getattr(response, "usage_metadata", None)
+        total = getattr(usage, "total_token_count", 0) or 0
+        if total > 0:
+            record_tokens(model, total)
 
-    return "No results returned."
+        # Extract text response
+        if response.candidates and response.candidates[0].content.parts:
+            result_text = ""
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, "text"):
+                    result_text += part.text
+            return result_text.strip() or "No results returned."
+
+        return "No results returned."
+    finally:
+        if in_afc:
+            _afc_api_semaphore.release()
 
 
 @GEMINI_RETRY_DECORATOR
@@ -780,6 +958,7 @@ def _gemini_code_exec(
     model: str = MODEL_CODE_EXEC,
 ) -> str:
     """Internal implementation of code execution with automatic retry."""
+    _sync_throttle(model)
     client = get_client()
 
     # Single stateless API call with Code Execution tool
@@ -791,6 +970,12 @@ def _gemini_code_exec(
             temperature=0,
         ),
     )
+
+    # Record token usage
+    usage = getattr(response, "usage_metadata", None)
+    total = getattr(usage, "total_token_count", 0) or 0
+    if total > 0:
+        record_tokens(model, total)
 
     # Extract execution results
     if response.candidates and response.candidates[0].content.parts:
@@ -832,13 +1017,23 @@ async def _consult(
         client = get_client()
         session_id = ctx.session_id
 
-        def _wrap(text: str) -> ToolResult:
+        def _wrap(resp: GeminiResponse) -> ToolResult:
             resolved = MODEL_ALIASES.get(model_alias.lower(), model_alias)
             elapsed_ms = round((time.monotonic() - t0) * 1000)
+            # Record token usage for rate limiting
+            if resp.total_tokens > 0:
+                record_tokens(resolved, resp.total_tokens)
             return ToolResult(
-                content=text,
-                structured_content={"result": text, "model": resolved},
-                meta={"model": resolved, "session_id": session_id, "duration_ms": elapsed_ms},
+                content=resp.text,
+                structured_content={"result": resp.text, "model": resolved},
+                meta={
+                    "model": resolved,
+                    "session_id": session_id,
+                    "duration_ms": elapsed_ms,
+                    "prompt_tokens": resp.prompt_tokens,
+                    "completion_tokens": resp.completion_tokens,
+                    "total_tokens": resp.total_tokens,
+                },
             )
 
         # Build generation config
@@ -874,7 +1069,7 @@ async def _consult(
         for path in file_paths or []:
             try:
                 p = Path(path)
-                size = await loop.run_in_executor(None, lambda p=p: p.stat().st_size)
+                size = await loop.run_in_executor(_EXECUTOR, lambda p=p: p.stat().st_size)
                 if size > MAX_FILE_SIZE:
                     return f"Error: '{path}' exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit."
                 content = await loop.run_in_executor(
@@ -890,13 +1085,13 @@ async def _consult(
         for path in media_paths or []:
             try:
                 p = Path(path)
-                size = await loop.run_in_executor(None, lambda p=p: p.stat().st_size)
+                size = await loop.run_in_executor(_EXECUTOR, lambda p=p: p.stat().st_size)
                 if size > MAX_INLINE_MEDIA:
                     return f"Error: '{path}' exceeds {MAX_INLINE_MEDIA // (1024*1024)}MB inline limit."
                 mime_type = detect_mime_type(path)
                 if not mime_type:
                     return f"Error: Unknown media type for '{path}'."
-                data = await loop.run_in_executor(None, lambda p=p: p.read_bytes())
+                data = await loop.run_in_executor(_EXECUTOR, lambda p=p: p.read_bytes())
                 parts.append(types.Part.from_bytes(data=data, mime_type=mime_type))
             except Exception as e:
                 return f"Error reading media '{path}': {e}"
@@ -921,61 +1116,68 @@ async def _consult(
 
         parts.append(types.Part.from_text(text=query))
 
-        # Hold lock during send to prevent concurrent access to same session
-        replacement = None
-        with lock:
-            try:
-                func = partial(_send_with_retry, session, parts, gen_config)
-                text = await loop.run_in_executor(None, func)
-                return _wrap(text)
-            except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
-                return f"Error: Service temporarily unavailable after retries: {e}"
-            except Exception as e:
-                error_msg = str(e).lower()
-                if "client" not in error_msg or ("closed" not in error_msg and "shutdown" not in error_msg):
-                    return f"Error: {e}"
+        # Proactive rate limiting with re-check and jitter
+        resolved_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
+        await _async_throttle(resolved_model, ctx)
 
-                logging.warning(f"Session '{session_id}' has stale client, recreating...")
-                prev_history = getattr(session, "_curated_history", getattr(session, "history", []))
-                prev_model = getattr(session, "_gpal_model", model_alias)
-
-                try:
-                    new_client = get_client()
-                    target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
-                    replacement = create_chat(new_client, target_model, history=prev_history, config=gen_config)
-                    replacement._gpal_model = prev_model
-                except Exception as retry_e:
-                    return f"Error after retry: {retry_e}"
-
-        if replacement:
-            with sessions_lock:
-                sessions[session_id] = (replacement, lock)
+        # Send with one retry on stale client
+        for attempt in range(2):
             with lock:
                 try:
-                    func = partial(_send_with_retry, replacement, parts, gen_config)
-                    text = await loop.run_in_executor(None, func)
-                    return _wrap(text)
-                except Exception as retry_e:
-                    return f"Error after retry: {retry_e}"
+                    func = partial(_send_with_retry, session, parts, gen_config)
+                    resp = await loop.run_in_executor(_EXECUTOR, func)
+                    return _wrap(resp)
+                except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
+                    return f"Error: Service temporarily unavailable after retries: {e}"
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    is_stale = "client" in error_msg and ("closed" in error_msg or "shutdown" in error_msg)
+                    if not is_stale or attempt > 0:
+                        return f"Error: {e}"
+
+                    logging.warning(f"Session '{session_id}' has stale client, recreating...")
+                    try:
+                        prev_history = getattr(session, "_curated_history", getattr(session, "history", []))
+                        new_client = get_client()
+                        target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
+                        session = create_chat(new_client, target_model, history=prev_history, config=gen_config)
+                        session._gpal_model = getattr(session, "_gpal_model", model_alias)
+                    except Exception as retry_e:
+                        return f"Error recreating session: {retry_e}"
+
+            # Update global state before retry
+            with sessions_lock:
+                sessions[session_id] = (session, lock)
 
 @GEMINI_RETRY_DECORATOR
-def _send_with_retry(session: Any, parts: list[types.Part], config: types.GenerateContentConfig) -> str:
+def _send_with_retry(session: Any, parts: list[types.Part], config: types.GenerateContentConfig) -> GeminiResponse:
     """Send message with automatic retry on transient errors."""
-    response = session.send_message(parts, config=config)
+    _afc_local.in_afc = True
+    try:
+        response = session.send_message(parts, config=config)
+    finally:
+        _afc_local.in_afc = False
+
+    # Extract usage metadata
+    usage = getattr(response, "usage_metadata", None)
+    prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
+    completion_tokens = getattr(usage, "candidates_token_count", 0) or 0
+    total_tokens = getattr(usage, "total_token_count", 0) or 0
+
     try:
         if response.text:
-            return response.text
+            return GeminiResponse(response.text, prompt_tokens, completion_tokens, total_tokens)
     except ValueError:
         pass  # No text parts — fall through to detailed diagnostics
 
     # Handle cases where no text was generated (e.g., max tool calls, safety block)
     candidate = response.candidates[0] if response.candidates else None
-    
+
     # finish_reason might be an enum or int, try to get a string representation
     finish_reason = getattr(candidate, "finish_reason", "UNKNOWN")
     if hasattr(finish_reason, "name"):
         finish_reason = finish_reason.name
-    
+
     details = []
     if candidate and candidate.content and candidate.content.parts:
         for part in candidate.content.parts:
@@ -988,7 +1190,8 @@ def _send_with_retry(session: Any, parts: list[types.Part], config: types.Genera
             elif hasattr(part, "code_execution_result") and part.code_execution_result:
                 details.append("[Code Result]")
 
-    return f"System: No text generated. Finish Reason: {finish_reason}. Partial content: {', '.join(details)}"
+    text = f"System: No text generated. Finish Reason: {finish_reason}. Partial content: {', '.join(details)}"
+    return GeminiResponse(text, prompt_tokens, completion_tokens, total_tokens)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1026,9 +1229,61 @@ def gemini_code_exec(
     return _gemini_code_exec(code, model)
 
 
-@mcp.tool(timeout=60)
-async def consult_gemini_flash(
+_FLASH_EXPLORE_PROMPT = """\
+You are in exploration mode. Your goal is to map the codebase thoroughly for a \
+follow-up synthesis phase. Map the territory — don't plan the journey.
+
+TASK: {query}
+
+STRATEGY:
+- Start with `semantic_search` to find conceptual entry points.
+- Use `list_directory` and `search_project` for specific definitions and patterns.
+- If a file is relevant and under 1000 lines, read the whole thing — you have a \
+massive context window; don't hunt for snippets when full context is cheap.
+- Use reasoning to follow imports, call chains, and data flow — that's navigation, \
+not analysis. Follow the thread wherever it leads.
+- Use `git` to check recent changes, blame, or history when provenance matters.
+
+DO NOT:
+- Propose fixes, write code, or provide recommendations.
+- Stop until you have a clear picture of the task's "surface area."
+
+OUTPUT — Structured Inventory:
+1. **Key Modules**: File paths with brief roles and important line numbers.
+2. **Data Flow**: How data moves through the components you found.
+3. **Patterns & Constants**: Architectural patterns, config values, shared conventions.
+4. **Files Read in Full**: List every file you read completely (so the synthesis phase \
+knows what's already in context).
+5. **Blind Spots**: Files referenced but not found, unclear ownership, anything unresolved.
+"""
+
+_PRO_SYNTHESIS_PROMPT = """\
+You are in the SYNTHESIS phase.
+
+CONTEXT:
+The conversation history above contains raw outputs from an exploration agent — \
+`read_file`, `search_project`, and `list_directory` results. Treat these as your \
+working memory. The exploration was thorough but may have gaps.
+
+TASK: {query}
+
+APPROACH:
+1. **Gap Check**: Scan the exploration data. If a critical file was referenced but \
+not read, use `read_file` to fetch it now. Do NOT restart broad exploration.
+2. **Root Cause / Analysis**: Explain *why* the code is structured this way. \
+Identify the specific logic relevant to the task.
+3. **Solution Design**: Propose a concrete, step-by-step plan.
+4. **Implementation**: Provide exact code changes with file paths. Include enough \
+surrounding context (or rewrite the full function) so changes can be applied unambiguously.
+
+GOAL: A complete, actionable response the user can apply immediately.
+"""
+
+
+@mcp.tool(timeout=660)
+async def consult_gemini(
     query: str,
+    model: str = "auto",
     file_paths: list[str] | None = None,
     media_paths: list[str] | None = None,
     file_uris: list[str] | None = None,
@@ -1037,47 +1292,176 @@ async def consult_gemini_flash(
     cached_content: str | None = None,
     ctx: Context | None = None,
 ) -> str | ToolResult:
-    """
-    Consults Gemini 3 Flash (Fast/Efficient) for codebase exploration.
+    """Consults Gemini for codebase analysis.
 
-    Use Flash only for quick exploration tasks (listing files, searching, navigating)
-    or when the user explicitly requests it. For code review, analysis, synthesis,
-    and all other tasks, use consult_gemini_pro instead — Pro is the default.
+    Args:
+        query: The question or instruction.
+        model: "auto" (default, Flash explore → Pro analyze), "flash", "pro", or full model ID.
+        file_paths: Text files to include as context.
+        media_paths: Images (.png, .jpg, .webp, .gif) or PDFs for vision analysis.
+        file_uris: Gemini File API URIs (from upload_file).
+        json_mode: Return structured JSON output.
+        response_schema: JSON schema string for structured output.
+        cached_content: Gemini context cache name.
 
     Gemini has autonomous access to: list_directory, read_file, search_project.
     """
     if ctx:
-        await ctx.debug(f"Flash query: session={ctx.session_id}, files={len(file_paths or [])}")
+        await ctx.debug(f"consult_gemini: model={model}, session={ctx.session_id}, files={len(file_paths or [])}")
 
+    if model == "auto":
+        # Phase 1: Flash explores
+        if ctx:
+            await ctx.info("Phase 1: Flash exploration...")
+        explore_query = _FLASH_EXPLORE_PROMPT.format(query=query)
+        flash_result = await _consult(
+            explore_query, ctx, "flash", file_paths,
+            media_paths, file_uris, False, None, cached_content
+        )
+
+        # Extract text from ToolResult or string
+        if isinstance(flash_result, ToolResult):
+            flash_text = flash_result.content or ""
+        else:
+            flash_text = flash_result
+
+        # Check for errors in flash phase
+        if isinstance(flash_text, str) and flash_text.startswith("Error:"):
+            return flash_result
+
+        # Phase 2: Pro synthesizes (same session — history migrates automatically)
+        if ctx:
+            await ctx.info("Phase 2: Pro synthesis...")
+        synthesis_query = _PRO_SYNTHESIS_PROMPT.format(query=query)
+        return await _consult(
+            synthesis_query, ctx, "pro", None,
+            None, None, json_mode, response_schema, None
+        )
+
+    # Direct model pass-through
+    alias = model if model in MODEL_ALIASES else model
     return await _consult(
-        query, ctx, "flash", file_paths,
+        query, ctx, alias, file_paths,
         media_paths, file_uris, json_mode, response_schema, cached_content
     )
 
 
-@mcp.tool(timeout=600)
-async def consult_gemini_pro(
+@mcp.tool(timeout=120)
+async def consult_gemini_oneshot(
     query: str,
+    model: str = "pro",
     file_paths: list[str] | None = None,
     media_paths: list[str] | None = None,
-    file_uris: list[str] | None = None,
     json_mode: bool = False,
     response_schema: str | None = None,
-    cached_content: str | None = None,
     ctx: Context | None = None,
 ) -> str | ToolResult:
-    """
-    Consults Gemini 3 Pro (Reasoning/Deep) for deep codebase analysis.
+    """Stateless single-shot Gemini query with no session history.
 
-    Gemini has autonomous access to: list_directory, read_file, search_project.
-    """
-    if ctx:
-        await ctx.debug(f"Pro query: session={ctx.session_id}, files={len(file_paths or [])}")
+    Use for independent questions, one-off lookups, or batch-style queries
+    where conversation context would be noise. Still has tool access
+    (list_directory, read_file, etc.) and retry logic.
 
-    return await _consult(
-        query, ctx, "pro", file_paths,
-        media_paths, file_uris, json_mode, response_schema, cached_content
-    )
+    Args:
+        query: The question or instruction.
+        model: "flash", "pro" (default), or full model ID.
+        file_paths: Text files to include as context.
+        media_paths: Images for vision analysis.
+        json_mode: Return structured JSON output.
+        response_schema: JSON schema string for structured output.
+    """
+    t0 = time.monotonic()
+    tracer = trace.get_tracer("gpal")
+
+    with tracer.start_as_current_span("gemini_oneshot") as span:
+        resolved_model = MODEL_ALIASES.get(model.lower(), model)
+        span.set_attribute("gpal.model", resolved_model)
+
+        client = get_client()
+        loop = asyncio.get_running_loop()
+
+        # Build parts
+        parts: list[types.Part] = []
+
+        for path in file_paths or []:
+            try:
+                p = Path(path)
+                size = await loop.run_in_executor(_EXECUTOR, lambda p=p: p.stat().st_size)
+                if size > MAX_FILE_SIZE:
+                    return f"Error: '{path}' exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit."
+                content = await loop.run_in_executor(
+                    None, lambda p=p: p.read_text(encoding="utf-8")
+                )
+                parts.append(types.Part.from_text(
+                    text=f"--- START FILE: {path} ---\n{content}\n--- END FILE: {path} ---\n"
+                ))
+            except Exception as e:
+                return f"Error reading file '{path}': {e}"
+
+        for path in media_paths or []:
+            try:
+                p = Path(path)
+                size = await loop.run_in_executor(_EXECUTOR, lambda p=p: p.stat().st_size)
+                if size > MAX_INLINE_MEDIA:
+                    return f"Error: '{path}' exceeds {MAX_INLINE_MEDIA // (1024*1024)}MB inline limit."
+                mime_type = detect_mime_type(path)
+                if not mime_type:
+                    return f"Error: Unknown media type for '{path}'."
+                data = await loop.run_in_executor(_EXECUTOR, lambda p=p: p.read_bytes())
+                parts.append(types.Part.from_bytes(data=data, mime_type=mime_type))
+            except Exception as e:
+                return f"Error reading media '{path}': {e}"
+
+        parts.append(types.Part.from_text(text=query))
+
+        # Build config
+        config_kwargs: dict[str, Any] = {
+            "temperature": 0.2,
+            "tools": [list_directory, read_file, search_project, gemini_search, semantic_search, git],
+            "automatic_function_calling": types.AutomaticFunctionCallingConfig(
+                disable=False,
+                maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
+            ),
+            "system_instruction": _system_instruction,
+        }
+        if json_mode:
+            config_kwargs["response_mime_type"] = "application/json"
+            if response_schema:
+                try:
+                    config_kwargs["response_schema"] = json.loads(response_schema)
+                except json.JSONDecodeError as e:
+                    return f"Error: Invalid JSON schema: {e}"
+
+        gen_config = types.GenerateContentConfig(**config_kwargs)
+
+        # Proactive rate limiting with re-check and jitter
+        await _async_throttle(resolved_model)
+
+        # Stateless call via chats.create with empty history
+        try:
+            session = create_chat(client, resolved_model, config=gen_config)
+            func = partial(_send_with_retry, session, parts, gen_config)
+            resp = await loop.run_in_executor(_EXECUTOR, func)
+
+            if resp.total_tokens > 0:
+                record_tokens(resolved_model, resp.total_tokens)
+
+            elapsed_ms = round((time.monotonic() - t0) * 1000)
+            return ToolResult(
+                content=resp.text,
+                structured_content={"result": resp.text, "model": resolved_model},
+                meta={
+                    "model": resolved_model,
+                    "duration_ms": elapsed_ms,
+                    "prompt_tokens": resp.prompt_tokens,
+                    "completion_tokens": resp.completion_tokens,
+                    "total_tokens": resp.total_tokens,
+                },
+            )
+        except (ServiceUnavailable, ResourceExhausted, InternalServerError) as e:
+            return f"Error: Service temporarily unavailable after retries: {e}"
+        except Exception as e:
+            return f"Error: {e}"
 
 
 @mcp.tool()
@@ -1148,6 +1532,9 @@ def delete_context_cache(cache_name: str) -> str:
 
 def semantic_search(query: str, limit: int = 5, path: str = ".") -> str:
     """Find code semantically related to the query using vector embeddings."""
+    in_afc = getattr(_afc_local, "in_afc", False)
+    if in_afc:
+        _afc_api_semaphore.acquire()
     try:
         index = get_index(path)
         results = index.search(query, limit)
@@ -1159,6 +1546,9 @@ def semantic_search(query: str, limit: int = 5, path: str = ".") -> str:
         return "\n".join(output)
     except Exception as e:
         return f"Error: {e}"
+    finally:
+        if in_afc:
+            _afc_api_semaphore.release()
 
 mcp.tool(semantic_search)
 
@@ -1250,6 +1640,7 @@ def _generate_image_nano_banana(
     image_size: str | None,
 ) -> bytes:
     """Generate an image via Gemini generate_content with IMAGE modality (Nano Banana)."""
+    _sync_throttle(model)
     config_kwargs: dict[str, Any] = {
         "response_modalities": ["TEXT", "IMAGE"],
     }
@@ -1266,17 +1657,23 @@ def _generate_image_nano_banana(
         contents=prompt,
         config=types.GenerateContentConfig(**config_kwargs),
     )
+    # Record token usage for Nano Banana (they consume tokens unlike Imagen)
+    usage = getattr(response, "usage_metadata", None)
+    total = getattr(usage, "total_token_count", 0) or 0
+    if total > 0:
+        record_tokens(model, total)
+
     if response.candidates:
         for part in response.candidates[0].content.parts:
             if part.inline_data and part.inline_data.mime_type.startswith("image/"):
                 return part.inline_data.data
-        
+
         # If we got candidates but no image part
         finish_reason = getattr(response.candidates[0], "finish_reason", "UNKNOWN")
         if hasattr(finish_reason, "name"):
             finish_reason = finish_reason.name
         raise ValueError(f"Nano Banana returned no image data. Finish reason: {finish_reason}")
-        
+
     raise ValueError("Nano Banana returned no candidates (possible safety filter)")
 
 
@@ -1325,6 +1722,7 @@ def generate_speech(text: str, output_path: str, voice_name: str = "Puck") -> st
     err = _validate_output_path(output_path)
     if err:
         return err
+    _sync_throttle(MODEL_SPEECH)
     client = get_client()
     try:
         response = client.models.generate_content(
@@ -1341,12 +1739,18 @@ def generate_speech(text: str, output_path: str, voice_name: str = "Puck") -> st
                 ),
             ),
         )
+        # Record token usage
+        usage = getattr(response, "usage_metadata", None)
+        total = getattr(usage, "total_token_count", 0) or 0
+        if total > 0:
+            record_tokens(MODEL_SPEECH, total)
+
         audio_bytes = b""
         if response.candidates:
             for part in response.candidates[0].content.parts:
                 if part.inline_data and "audio" in part.inline_data.mime_type:
                     audio_bytes += part.inline_data.data
-        
+
         if audio_bytes:
             # Gemini TTS returns raw PCM (16-bit, 24kHz, mono). 
             # If saving as .wav, we must add the header.
