@@ -114,7 +114,7 @@ and converts `TimeoutError` to `McpError(-32000)`.
 | Tool | Timeout | Rationale |
 |------|---------|-----------|
 | `consult_gemini` | 660s | Unified tool (auto mode: Flash explore + Pro synthesize) |
-| `consult_gemini_oneshot` | 120s | Stateless single-shot queries |
+| `consult_gemini_oneshot` | 600s | Stateless queries (Pro+thinking can be slow) |
 | `rebuild_index` | 300s | Large index rebuilds |
 | All others | None | Quick sync operations |
 

@@ -18,14 +18,16 @@ import tomllib
 import wave
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
+
+from pydantic import Field
 
 import glob as globlib
 from cachetools import TTLCache
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
+from mcp.types import ToolAnnotations
 from google import genai
 from google.genai import errors as genai_errors, types
 from google.genai.types import GoogleSearch, Tool, ToolCodeExecution
@@ -151,6 +153,31 @@ def _wait_with_retry_delay(retry_state: Any) -> float:
     return wait_exponential_jitter(initial=2, max=60, jitter=5)(retry_state)
 
 
+def _before_sleep_with_mcp(retry_state: Any) -> None:
+    """Log retry attempts via Python logging and MCP notifications when available.
+
+    Reads MCP context from _afc_local thread-local (set by callers that have ctx).
+    """
+    # Standard Python logging (always)
+    before_sleep_log(logging.getLogger(__name__), logging.WARNING)(retry_state)
+
+    # MCP notification (when context available)
+    ctx = getattr(_afc_local, "mcp_ctx", None)
+    loop = getattr(_afc_local, "mcp_loop", None)
+    if ctx and loop:
+        exc = retry_state.outcome.exception() if retry_state.outcome else None
+        attempt = retry_state.attempt_number
+        delay = _extract_retry_delay(exc) if exc else None
+        if delay:
+            msg = f"Rate limited by Gemini API, retry {attempt}/5 in ~{delay:.0f}s (server requested)..."
+        else:
+            msg = f"Gemini API error, retry {attempt}/5..."
+        try:
+            asyncio.run_coroutine_threadsafe(ctx.warning(msg), loop).result(timeout=5)
+        except Exception:
+            pass  # Don't let MCP logging failures break retry logic
+
+
 # Disable SDK-internal retry for calls wrapped by our decorator.
 # The SDK has its own 5-attempt tenacity retry that ignores RetryInfo.
 # We suppress it so our retry (which honors RetryInfo) handles everything.
@@ -161,7 +188,7 @@ GEMINI_RETRY_DECORATOR = retry(
     stop=stop_after_attempt(5),
     wait=_wait_with_retry_delay,
     retry=retry_if_exception(_is_retriable_genai_error),
-    before_sleep=before_sleep_log(logging.getLogger(__name__), logging.WARNING),
+    before_sleep=_before_sleep_with_mcp,
     reraise=True,
 )
 
@@ -1187,8 +1214,15 @@ async def _consult(
         for attempt in range(2):
             with lock:
                 try:
-                    func = partial(_send_with_retry, session, parts, gen_config)
-                    resp = await loop.run_in_executor(_EXECUTOR, func)
+                    def _run():
+                        _afc_local.mcp_ctx = ctx
+                        _afc_local.mcp_loop = loop
+                        try:
+                            return _send_with_retry(session, parts, gen_config)
+                        finally:
+                            _afc_local.mcp_ctx = None
+                            _afc_local.mcp_loop = None
+                    resp = await loop.run_in_executor(_EXECUTOR, _run)
                     return _wrap(resp)
                 except genai_errors.APIError as e:
                     if _is_retriable_genai_error(e):
@@ -1280,17 +1314,15 @@ def gemini_search(
 mcp.tool(gemini_search)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
 def gemini_code_exec(
-    code: str,
-    model: str = MODEL_CODE_EXEC,
+    code: Annotated[str, Field(description="Python code to execute")],
+    model: Annotated[str, Field(default=MODEL_CODE_EXEC, description="Model to use for code execution")] = MODEL_CODE_EXEC,
 ) -> str:
-    """
-    Execute Python code using Gemini's built-in code execution sandbox.
+    """Execute Python code using Gemini's built-in code execution sandbox.
 
     Returns stdout, stderr, and any execution results.
-    Stateless utility.
-    """
+    Stateless utility."""
     return _gemini_code_exec(code, model)
 
 
@@ -1345,32 +1377,21 @@ GOAL: A complete, actionable response the user can apply immediately.
 """
 
 
-@mcp.tool(timeout=660)
+@mcp.tool(timeout=660, annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
 async def consult_gemini(
-    query: str,
-    model: str = "auto",
-    file_paths: list[str] | None = None,
-    media_paths: list[str] | None = None,
-    file_uris: list[str] | None = None,
-    json_mode: bool = False,
-    response_schema: str | None = None,
-    cached_content: str | None = None,
+    query: Annotated[str, Field(description="The question or instruction")],
+    model: Annotated[str, Field(default="auto", description='"auto" (default, Flash explore → Pro analyze), "flash", "pro", or full model ID')] = "auto",
+    file_paths: Annotated[list[str] | None, Field(default=None, description="Local text files to read and include inline as context")] = None,
+    media_paths: Annotated[list[str] | None, Field(default=None, description="Local image/PDF files (.png, .jpg, .webp, .gif, .pdf) for vision analysis")] = None,
+    file_uris: Annotated[list[str] | None, Field(default=None, description="Gemini File API URIs (from upload_file). Use for large files that exceed inline limits")] = None,
+    json_mode: Annotated[bool, Field(default=False, description="Return structured JSON output")] = False,
+    response_schema: Annotated[str | None, Field(default=None, description="JSON schema string for structured output")] = None,
+    cached_content: Annotated[str | None, Field(default=None, description="Gemini context cache name")] = None,
     ctx: Context | None = None,
 ) -> str | ToolResult:
     """Consults Gemini for codebase analysis.
 
-    Args:
-        query: The question or instruction.
-        model: "auto" (default, Flash explore → Pro analyze), "flash", "pro", or full model ID.
-        file_paths: Text files to include as context.
-        media_paths: Images (.png, .jpg, .webp, .gif) or PDFs for vision analysis.
-        file_uris: Gemini File API URIs (from upload_file).
-        json_mode: Return structured JSON output.
-        response_schema: JSON schema string for structured output.
-        cached_content: Gemini context cache name.
-
-    Gemini has autonomous access to: list_directory, read_file, search_project.
-    """
+    Gemini has autonomous access to: list_directory, read_file, search_project."""
     if ctx:
         await ctx.debug(f"consult_gemini: model={model}, session={ctx.session_id}, files={len(file_paths or [])}")
 
@@ -1411,30 +1432,22 @@ async def consult_gemini(
     )
 
 
-@mcp.tool(timeout=600)
+@mcp.tool(timeout=600, annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
 async def consult_gemini_oneshot(
-    query: str,
-    model: str = "pro",
-    file_paths: list[str] | None = None,
-    media_paths: list[str] | None = None,
-    json_mode: bool = False,
-    response_schema: str | None = None,
+    query: Annotated[str, Field(description="The question or instruction")],
+    model: Annotated[str, Field(default="pro", description='"flash", "pro" (default), or full model ID')] = "pro",
+    file_paths: Annotated[list[str] | None, Field(default=None, description="Local text files to read and include inline as context")] = None,
+    media_paths: Annotated[list[str] | None, Field(default=None, description="Local image/PDF files (.png, .jpg, .webp, .gif, .pdf) for vision analysis")] = None,
+    file_uris: Annotated[list[str] | None, Field(default=None, description="Gemini File API URIs (from upload_file). Use for large files that exceed inline limits")] = None,
+    json_mode: Annotated[bool, Field(default=False, description="Return structured JSON output")] = False,
+    response_schema: Annotated[str | None, Field(default=None, description="JSON schema string for structured output")] = None,
     ctx: Context | None = None,
 ) -> str | ToolResult:
     """Stateless single-shot Gemini query with no session history.
 
     Use for independent questions, one-off lookups, or batch-style queries
     where conversation context would be noise. Still has tool access
-    (list_directory, read_file, etc.) and retry logic.
-
-    Args:
-        query: The question or instruction.
-        model: "flash", "pro" (default), or full model ID.
-        file_paths: Text files to include as context.
-        media_paths: Images for vision analysis.
-        json_mode: Return structured JSON output.
-        response_schema: JSON schema string for structured output.
-    """
+    (list_directory, read_file, etc.) and retry logic."""
     t0 = time.monotonic()
     tracer = trace.get_tracer("gpal")
 
@@ -1477,6 +1490,21 @@ async def consult_gemini_oneshot(
             except Exception as e:
                 return f"Error reading media '{path}': {e}"
 
+        for uri in file_uris or []:
+            mime = None
+            with uploaded_files_lock:
+                cached = uploaded_files.get(uri)
+            if cached and cached.mime_type:
+                mime = cached.mime_type
+            else:
+                try:
+                    file_id = uri.rstrip("/").rsplit("/", 1)[-1]
+                    file_meta = client.files.get(name=f"files/{file_id}")
+                    mime = file_meta.mime_type
+                except Exception:
+                    pass
+            parts.append(types.Part.from_uri(file_uri=uri, mime_type=mime))
+
         parts.append(types.Part.from_text(text=query))
 
         # Build config
@@ -1506,8 +1534,15 @@ async def consult_gemini_oneshot(
         # Stateless call via chats.create with empty history
         try:
             session = create_chat(client, resolved_model, config=gen_config)
-            func = partial(_send_with_retry, session, parts, gen_config)
-            resp = await loop.run_in_executor(_EXECUTOR, func)
+            def _run():
+                _afc_local.mcp_ctx = ctx
+                _afc_local.mcp_loop = loop
+                try:
+                    return _send_with_retry(session, parts, gen_config)
+                finally:
+                    _afc_local.mcp_ctx = None
+                    _afc_local.mcp_loop = None
+            resp = await loop.run_in_executor(_EXECUTOR, _run)
 
             if resp.total_tokens > 0:
                 record_tokens(resolved_model, resp.total_tokens)
@@ -1532,8 +1567,11 @@ async def consult_gemini_oneshot(
             return f"Error: {e}"
 
 
-@mcp.tool()
-def upload_file(file_path: str, display_name: str | None = None) -> str:
+@mcp.tool(annotations=ToolAnnotations(idempotentHint=True, openWorldHint=True))
+def upload_file(
+    file_path: Annotated[str, Field(description="Path to the local file to upload")],
+    display_name: Annotated[str | None, Field(default=None, description="Display name in the Files API (defaults to filename)")] = None,
+) -> str:
     """Upload a large file to Gemini's File API."""
     client = get_client()
     path = Path(file_path)
@@ -1550,19 +1588,17 @@ def upload_file(file_path: str, display_name: str | None = None) -> str:
         return f"Error: {e}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(idempotentHint=True, openWorldHint=True))
 def create_context_cache(
-    file_uris: list[str],
-    model: str = "flash",
-    display_name: str | None = None,
-    ttl_seconds: int = 3600,
+    file_uris: Annotated[list[str], Field(description="Gemini File API URIs (from upload_file)")],
+    model: Annotated[str, Field(default="flash", description="Model alias or explicit version ID")] = "flash",
+    display_name: Annotated[str | None, Field(default=None, description="Display name for the cache")] = None,
+    ttl_seconds: Annotated[int, Field(default=3600, description="Cache TTL in seconds (default 1 hour)")] = 3600,
 ) -> str:
-    """
-    Create a Gemini context cache for a set of files.
-    
+    """Create a Gemini context cache for a set of files.
+
     Caching is useful for large files (>32k tokens) used across multiple turns.
-    Model must be an explicit version (e.g., gemini-1.5-flash-001) or a supported alias.
-    """
+    Model must be an explicit version (e.g., gemini-1.5-flash-001) or a supported alias."""
     client = get_client()
     resolved_model = MODEL_ALIASES.get(model.lower(), model)
     
@@ -1587,8 +1623,10 @@ def create_context_cache(
         return f"Error creating cache: {e}"
 
 
-@mcp.tool()
-def delete_context_cache(cache_name: str) -> str:
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True, openWorldHint=True))
+def delete_context_cache(
+    cache_name: Annotated[str, Field(description="Cache name to delete (from create_context_cache)")],
+) -> str:
     """Delete a Gemini context cache."""
     client = get_client()
     try:
@@ -1598,7 +1636,11 @@ def delete_context_cache(cache_name: str) -> str:
         return f"Error deleting cache: {e}"
 
 
-def semantic_search(query: str, limit: int = 5, path: str = ".") -> str:
+def semantic_search(
+    query: Annotated[str, Field(description="Natural language query to search for")],
+    limit: Annotated[int, Field(default=5, description="Maximum number of results")] = 5,
+    path: Annotated[str, Field(default=".", description="Root path of the codebase to search")] = ".",
+) -> str:
     """Find code semantically related to the query using vector embeddings."""
     in_afc = getattr(_afc_local, "in_afc", False)
     if in_afc:
@@ -1621,8 +1663,11 @@ def semantic_search(query: str, limit: int = 5, path: str = ".") -> str:
 mcp.tool(semantic_search)
 
 
-@mcp.tool(timeout=300)
-async def rebuild_index(path: str = ".", ctx: Context | None = None) -> str:
+@mcp.tool(timeout=300, annotations=ToolAnnotations(openWorldHint=True))
+async def rebuild_index(
+    path: Annotated[str, Field(default=".", description="Root path of the codebase to index")] = ".",
+    ctx: Context | None = None,
+) -> str:
     """Rebuild the semantic search index for a codebase."""
     try:
         if ctx:
@@ -1649,7 +1694,7 @@ async def rebuild_index(path: str = ".", ctx: Context | None = None) -> str:
         return f"Error: {e}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=True))
 def list_models() -> str:
     """List available Gemini models grouped by capability.
 
@@ -1748,13 +1793,13 @@ def _generate_image_nano_banana(
 NANO_BANANA_MODELS = {MODEL_IMAGE_PRO, MODEL_IMAGE_FLASH, "nano-banana-pro-preview"}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(openWorldHint=True))
 def generate_image(
-    prompt: str,
-    output_path: str,
-    model: str = "imagen",
-    aspect_ratio: str | None = None,
-    image_size: str | None = None,
+    prompt: Annotated[str, Field(description="Text description of the image to generate")],
+    output_path: Annotated[str, Field(description="File path to save the generated image")],
+    model: Annotated[str, Field(default="imagen", description='"imagen" (default, ultra), "imagen-fast", "nano-pro", or "nano-flash"')] = "imagen",
+    aspect_ratio: Annotated[str | None, Field(default=None, description='Aspect ratio (e.g. "1:1", "16:9", "9:16", "4:3", "3:4")')] = None,
+    image_size: Annotated[str | None, Field(default=None, description='Output size for Nano Banana only (e.g. "1024x1024"). Not supported by Imagen')] = None,
 ) -> str:
     """Generates an image using Imagen or Nano Banana (Gemini image) models.
 
@@ -1784,8 +1829,13 @@ def generate_image(
         return f"Error: {e}"
 
 
-@mcp.tool()
-def generate_speech(text: str, output_path: str, voice_name: str = "Puck", model: str = "speech") -> str:
+@mcp.tool(annotations=ToolAnnotations(openWorldHint=True))
+def generate_speech(
+    text: Annotated[str, Field(description="Text to synthesize into speech")],
+    output_path: Annotated[str, Field(description="File path to save the generated audio (.wav)")],
+    voice_name: Annotated[str, Field(default="Puck", description="Voice name (e.g. Puck, Charon, Kore, Fenrir, Aoede)")] = "Puck",
+    model: Annotated[str, Field(default="speech", description='"speech" (default, Pro quality) or "speech-fast"')] = "speech",
+) -> str:
     """Synthesizes speech from text."""
     err = _validate_output_path(output_path)
     if err:
