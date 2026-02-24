@@ -133,7 +133,7 @@ FastMCP 3.0 handles distributed trace context automatically via `inject_trace_co
 
 Single unified tool for all Gemini consultations:
 
-- **`model="auto"`** (default): Flash explores the codebase autonomously (cheap, fast), then Pro synthesizes findings. Uses session history migration — same session ID, Flash history flows to Pro automatically.
+- **`model="auto"`** (default): Two-phase pipeline. Flash aggressively loads full file contents into context (reads everything in full — Pro can't fill gaps). Then Pro runs with **no tools and thinking enabled** — pure deep analysis over the rich context Flash loaded. Uses session history migration — same session ID, Flash history flows to Pro automatically.
 - **`model="flash"`** or **`model="pro"`**: Direct pass-through to a specific model.
 - **`consult_gemini_oneshot`**: Separate stateless tool, no session. For independent questions where conversation context is noise.
 

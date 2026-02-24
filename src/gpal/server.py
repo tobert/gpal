@@ -1092,6 +1092,7 @@ async def _consult(
     json_mode: bool = False,
     response_schema: str | None = None,
     cached_content: str | None = None,
+    tools_enabled: bool = True,
 ) -> str | ToolResult:
     """Send a query to Gemini with codebase context."""
     t0 = time.monotonic()
@@ -1126,16 +1127,26 @@ async def _consult(
             )
 
         # Build generation config
+        # Always provide tools so history containing function calls remains valid
         config_kwargs: dict[str, Any] = {
             "temperature": 0.2,
             "tools": [list_directory, read_file, search_project, gemini_search, semantic_search, git],
-            "automatic_function_calling": types.AutomaticFunctionCallingConfig(
-                disable=False,
-                maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
-            ),
             "system_instruction": _system_instruction,
             "http_options": _NO_SDK_RETRY,
         }
+
+        if tools_enabled:
+            config_kwargs["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(
+                disable=False,
+                maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
+            )
+        else:
+            # Tools stay in config for history validation, but AFC is disabled
+            # so Pro won't make autonomous tool calls
+            config_kwargs["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(
+                disable=True,
+            )
+            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="HIGH")
 
         if json_mode:
             config_kwargs["response_mime_type"] = "application/json"
@@ -1327,16 +1338,19 @@ def gemini_code_exec(
 
 
 _FLASH_EXPLORE_PROMPT = """\
-You are in exploration mode. Your goal is to map the codebase thoroughly for a \
-follow-up synthesis phase. Map the territory — don't plan the journey.
+You are in exploration mode. Your goal is to load comprehensive codebase context for a \
+follow-up synthesis phase. The synthesis phase has NO tool access — every file you skip \
+is a file it can never see.
 
 TASK: {query}
 
 STRATEGY:
 - Start with `semantic_search` to find conceptual entry points.
 - Use `list_directory` and `search_project` for specific definitions and patterns.
-- If a file is relevant and under 1000 lines, read the whole thing — you have a \
-massive context window; don't hunt for snippets when full context is cheap.
+- **Always read files in full.** You have a massive context window — use it. Complete \
+source files enable holistic observations that snippets miss.
+- Read related files too: tests, configs, type definitions, imports. Cast a wide net — \
+the synthesis phase cannot fill gaps.
 - Use reasoning to follow imports, call chains, and data flow — that's navigation, \
 not analysis. Follow the thread wherever it leads.
 - Use `git` to check recent changes, blame, or history when provenance matters.
@@ -1344,34 +1358,36 @@ not analysis. Follow the thread wherever it leads.
 DO NOT:
 - Propose fixes, write code, or provide recommendations.
 - Stop until you have a clear picture of the task's "surface area."
+- Skip files to save tokens — thoroughness is the priority.
 
 OUTPUT — Structured Inventory:
 1. **Key Modules**: File paths with brief roles and important line numbers.
 2. **Data Flow**: How data moves through the components you found.
 3. **Patterns & Constants**: Architectural patterns, config values, shared conventions.
-4. **Files Read in Full**: List every file you read completely (so the synthesis phase \
-knows what's already in context).
+4. **Files Read in Full**: List every file you read completely (critical — the synthesis \
+phase relies on this context being present in the conversation).
 5. **Blind Spots**: Files referenced but not found, unclear ownership, anything unresolved.
 """
 
 _PRO_SYNTHESIS_PROMPT = """\
-You are in the SYNTHESIS phase.
+You are in the SYNTHESIS phase. You have NO tool access — all relevant source code \
+has been loaded into the conversation by the exploration phase.
 
 CONTEXT:
-The conversation history above contains raw outputs from an exploration agent — \
-`read_file`, `search_project`, and `list_directory` results. Treat these as your \
-working memory. The exploration was thorough but may have gaps.
+The conversation history above contains complete file contents, search results, and \
+directory listings from a thorough exploration agent. You have full source files to \
+work with — leverage the complete context for holistic analysis.
 
 TASK: {query}
 
 APPROACH:
-1. **Gap Check**: Scan the exploration data. If a critical file was referenced but \
-not read, use `read_file` to fetch it now. Do NOT restart broad exploration.
-2. **Root Cause / Analysis**: Explain *why* the code is structured this way. \
-Identify the specific logic relevant to the task.
-3. **Solution Design**: Propose a concrete, step-by-step plan.
-4. **Implementation**: Provide exact code changes with file paths. Include enough \
+1. **Analysis**: Using the loaded source code, explain *why* the code is structured \
+this way. Identify the specific logic relevant to the task.
+2. **Solution Design**: Propose a concrete, step-by-step plan.
+3. **Implementation**: Provide exact code changes with file paths. Include enough \
 surrounding context (or rewrite the full function) so changes can be applied unambiguously.
+4. **Gaps**: If the exploration missed something critical, note it as a limitation \
+rather than trying to fill the gap.
 
 GOAL: A complete, actionable response the user can apply immediately.
 """
@@ -1416,12 +1432,14 @@ async def consult_gemini(
             return flash_result
 
         # Phase 2: Pro synthesizes (same session — history migrates automatically)
+        # Pro runs tool-free with thinking enabled — pure analysis over Flash's context
         if ctx:
-            await ctx.info("Phase 2: Pro synthesis...")
+            await ctx.info("Phase 2: Pro synthesis (thinking, AFC disabled)...")
         synthesis_query = _PRO_SYNTHESIS_PROMPT.format(query=query)
         return await _consult(
             synthesis_query, ctx, "pro", None,
-            None, None, json_mode, response_schema, None
+            None, None, json_mode, response_schema, None,
+            tools_enabled=False
         )
 
     # Direct model pass-through
