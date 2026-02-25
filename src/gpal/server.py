@@ -596,7 +596,7 @@ def list_sessions_resource() -> str:
 
 
 @mcp.resource("gpal://session/{session_id}")
-def get_session_detail(session_id: str) -> str:
+async def get_session_detail(session_id: str) -> str:
     """View conversation history for a session."""
     with sessions_lock:
         item = sessions.get(session_id)
@@ -605,7 +605,7 @@ def get_session_detail(session_id: str) -> str:
         session, lock = item
 
     # Hold per-session lock while reading history
-    with lock:
+    async with lock:
         model = getattr(session, "_gpal_model", "unknown")
         history = getattr(session, "_curated_history", getattr(session, "history", []))
 
@@ -746,6 +746,19 @@ def check_model_freshness() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _validate_input_path(path: str) -> str | None:
+    """Validate that an input path is within the project root.
+    Returns None if valid, or an error message string if not."""
+    try:
+        p = Path(path).resolve()
+        cwd = Path.cwd().resolve()
+        if not p.is_relative_to(cwd):
+            return f"Error: Access denied — '{path}' is outside the project root."
+        return None
+    except Exception as e:
+        return f"Error validating path '{path}': {e}"
+
+
 def _validate_output_path(path: str) -> str | None:
     """Validate that an output path is within the project root.
 
@@ -765,15 +778,13 @@ def _validate_output_path(path: str) -> str | None:
 
 def list_directory(path: str = ".") -> list[str] | str:
     """List files and directories at the given path."""
+    err = _validate_input_path(path)
+    if err:
+        logging.warning(err)
+        return err
+
     try:
         p = Path(path).resolve()
-        cwd = Path.cwd().resolve()
-        
-        if not p.is_relative_to(cwd):
-            msg = f"Error: Access denied to '{path}' (outside project root)"
-            logging.warning(msg)
-            return msg
-            
         if not p.exists():
             msg = f"Error: Path '{path}' does not exist"
             logging.warning(msg)
@@ -787,19 +798,18 @@ def list_directory(path: str = ".") -> list[str] | str:
 
 def read_file(path: str) -> str:
     """Read the content of a file (up to MAX_FILE_SIZE bytes)."""
+    err = _validate_input_path(path)
+    if err:
+        return err
+
     try:
         p = Path(path).resolve()
-        cwd = Path.cwd().resolve()
-        
-        if not p.is_relative_to(cwd):
-            return f"Error: Access denied to '{path}' (outside project root)."
-            
         if not p.exists():
             return f"Error: File '{path}' does not exist."
-            
+
         if p.stat().st_size > MAX_FILE_SIZE:
             return f"Error: File '{path}' exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit."
-        return p.read_text(encoding="utf-8")
+        return p.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         return f"Error reading file '{path}': {e}"
 
@@ -809,6 +819,9 @@ def search_project(search_term: str, glob_pattern: str = "**/*") -> str:
     Search for a text term in files matching the glob pattern.
     Returns a summary of matching files.
     """
+    if Path(glob_pattern).is_absolute():
+        return "Error: Absolute glob patterns are not allowed. Use relative patterns."
+
     try:
         cwd = Path.cwd().resolve()
 
@@ -831,7 +844,7 @@ def search_project(search_term: str, glob_pattern: str = "**/*") -> str:
                 )
 
             try:
-                with open(filepath, encoding="utf-8", errors="ignore") as f:
+                with open(filepath, encoding="utf-8", errors="replace") as f:
                     if search_term in f.read():
                         matches.append(f"Match in: {filepath}")
                         if len(matches) >= MAX_SEARCH_MATCHES:
@@ -950,7 +963,7 @@ async def get_session(
     client: genai.Client,
     model_alias: str,
     config: types.GenerateContentConfig | None = None,
-) -> tuple[Any, threading.Lock]:
+) -> tuple[Any, asyncio.Lock]:
     """Get or create a session, bundled with its own lock."""
     session_id = ctx.session_id
     target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
@@ -961,13 +974,13 @@ async def get_session(
         else:
             session = create_chat(client, target_model, config=config)
             session._gpal_model = target_model
-            lock = threading.Lock()
+            lock = asyncio.Lock()
             sessions[session_id] = (session, lock)
             ctx.set_state("model", target_model)
             return session, lock
 
     # Use per-session lock for migration
-    with lock:
+    async with lock:
         current_model = getattr(session, "_gpal_model", None)
         if current_model == target_model:
             return session, lock
@@ -1171,13 +1184,16 @@ async def _consult(
 
         # Context: Text files (offloaded to thread pool to avoid blocking event loop)
         for path in file_paths or []:
+            err = _validate_input_path(path)
+            if err:
+                return err
             try:
                 p = Path(path)
                 size = await loop.run_in_executor(_EXECUTOR, lambda p=p: p.stat().st_size)
                 if size > MAX_FILE_SIZE:
                     return f"Error: '{path}' exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit."
                 content = await loop.run_in_executor(
-                    None, lambda p=p: p.read_text(encoding="utf-8")
+                    _EXECUTOR, lambda p=p: p.read_text(encoding="utf-8", errors="replace")
                 )
                 parts.append(types.Part.from_text(
                     text=f"--- START FILE: {path} ---\n{content}\n--- END FILE: {path} ---\n"
@@ -1187,6 +1203,9 @@ async def _consult(
 
         # Context: Inline media (offloaded to thread pool)
         for path in media_paths or []:
+            err = _validate_input_path(path)
+            if err:
+                return err
             try:
                 p = Path(path)
                 size = await loop.run_in_executor(_EXECUTOR, lambda p=p: p.stat().st_size)
@@ -1226,7 +1245,7 @@ async def _consult(
 
         # Send with one retry on stale client
         for attempt in range(2):
-            with lock:
+            async with lock:
                 try:
                     def _run():
                         _afc_local.mcp_ctx = ctx
@@ -1483,13 +1502,16 @@ async def consult_gemini_oneshot(
         parts: list[types.Part] = []
 
         for path in file_paths or []:
+            err = _validate_input_path(path)
+            if err:
+                return err
             try:
                 p = Path(path)
                 size = await loop.run_in_executor(_EXECUTOR, lambda p=p: p.stat().st_size)
                 if size > MAX_FILE_SIZE:
                     return f"Error: '{path}' exceeds {MAX_FILE_SIZE // (1024*1024)}MB limit."
                 content = await loop.run_in_executor(
-                    None, lambda p=p: p.read_text(encoding="utf-8")
+                    _EXECUTOR, lambda p=p: p.read_text(encoding="utf-8", errors="replace")
                 )
                 parts.append(types.Part.from_text(
                     text=f"--- START FILE: {path} ---\n{content}\n--- END FILE: {path} ---\n"
@@ -1498,6 +1520,9 @@ async def consult_gemini_oneshot(
                 return f"Error reading file '{path}': {e}"
 
         for path in media_paths or []:
+            err = _validate_input_path(path)
+            if err:
+                return err
             try:
                 p = Path(path)
                 size = await loop.run_in_executor(_EXECUTOR, lambda p=p: p.stat().st_size)
@@ -1594,6 +1619,9 @@ def upload_file(
     display_name: Annotated[str | None, Field(default=None, description="Display name in the Files API (defaults to filename)")] = None,
 ) -> str:
     """Upload a large file to Gemini's File API."""
+    err = _validate_input_path(file_path)
+    if err:
+        return err
     client = get_client()
     path = Path(file_path)
     if not path.exists():
@@ -1663,6 +1691,9 @@ def semantic_search(
     path: Annotated[str, Field(default=".", description="Root path of the codebase to search")] = ".",
 ) -> str:
     """Find code semantically related to the query using vector embeddings."""
+    err = _validate_input_path(path)
+    if err:
+        return err
     in_afc = getattr(_afc_local, "in_afc", False)
     if in_afc:
         _afc_api_semaphore.acquire()
@@ -1690,6 +1721,9 @@ async def rebuild_index(
     ctx: Context | None = None,
 ) -> str:
     """Rebuild the semantic search index for a codebase."""
+    err = _validate_input_path(path)
+    if err:
+        return err
     try:
         if ctx:
             await ctx.info(f"Rebuilding semantic index for {path}")

@@ -278,8 +278,8 @@ class CodebaseIndex:
         Returns a list of dicts with id, text, and metadata for each chunk.
         """
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except (UnicodeDecodeError, OSError):
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
             return []
 
         if not lines:

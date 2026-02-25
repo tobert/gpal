@@ -198,12 +198,18 @@ def test_chunk_file_empty(simple_index, tmp_path):
 
 
 def test_chunk_file_binary_content(simple_index, tmp_path):
-    """Files with binary content (non-UTF8) produce no chunks."""
+    """Files with non-UTF8 bytes get replacement characters instead of crashing.
+
+    Binary files are filtered by _should_index() (extension check), but if
+    _chunk_file is called directly, it should handle bad bytes gracefully.
+    """
     binary_file = tmp_path / "data.bin"
     binary_file.write_bytes(b"\x80\x81\x82\x83")
 
     chunks = simple_index._chunk_file(binary_file)
-    assert chunks == []
+    # errors="replace" produces replacement chars, so we get chunks
+    assert len(chunks) == 1
+    assert "\ufffd" in chunks[0]["text"]  # U+FFFD replacement character
 
 
 def test_chunk_file_id_format(simple_index, tmp_path):

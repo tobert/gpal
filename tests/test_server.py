@@ -15,11 +15,12 @@ from pathlib import Path
 from fastmcp import Client
 from unittest.mock import patch
 from gpal.server import (
-    mcp, _validate_output_path,
+    mcp, _validate_input_path, _validate_output_path,
     record_tokens, tokens_in_window, token_stats, GeminiResponse,
     _sync_throttle, _async_throttle, _KNOWN_MODELS, MODEL_SEARCH,
     RATE_LIMITS_TPM, _afc_local, _send_with_retry, _EXECUTOR,
     _extract_retry_delay, _is_retriable_genai_error,
+    search_project,
 )
 
 
@@ -486,3 +487,44 @@ def test_is_not_retriable_400():
 def test_is_not_retriable_non_api_error():
     """Non-APIError exceptions are not retriable."""
     assert _is_retriable_genai_error(RuntimeError("boom")) is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# K. Input Path Validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_validate_input_path_within_cwd(tmp_path, monkeypatch):
+    """Paths under cwd are accepted."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "data.txt").write_text("hello")
+    result = _validate_input_path(str(tmp_path / "data.txt"))
+    assert result is None
+
+
+def test_validate_input_path_rejects_traversal(tmp_path, monkeypatch):
+    """Path traversal outside cwd is rejected."""
+    monkeypatch.chdir(tmp_path)
+    result = _validate_input_path("../../../etc/passwd")
+    assert result is not None
+    assert "outside" in result.lower() or "denied" in result.lower()
+
+
+def test_validate_input_path_rejects_absolute(tmp_path, monkeypatch):
+    """Absolute paths to system dirs are rejected."""
+    monkeypatch.chdir(tmp_path)
+    result = _validate_input_path("/etc/passwd")
+    assert result is not None
+    assert "denied" in result.lower()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# L. Search Project Glob Validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_search_project_rejects_absolute_glob(tmp_path, monkeypatch):
+    """Absolute glob patterns are rejected early."""
+    monkeypatch.chdir(tmp_path)
+    result = search_project("test", glob_pattern="/etc/**/*")
+    assert "absolute" in result.lower()

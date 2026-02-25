@@ -1,6 +1,6 @@
 [project]
 name = "gpal"
-version = "0.7.1"
+version = "0.7.3"
 description = "An MCP server providing stateful Gemini access with autonomous codebase exploration"
 readme = "README.md"
 license = "MIT"
