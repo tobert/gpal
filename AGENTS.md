@@ -46,6 +46,7 @@ Gemini catches real issues — see git history for proof.
 │                                                     │
 │  Gemini has internal tools:                         │
 │  • list_directory  • read_file  • search_project   │
+│  • url_context    • file_search (when stores exist) │
 │                                                     │
 │  Automatic Function Calling enabled                 │
 │  (Gemini autonomously explores the codebase)        │
@@ -58,12 +59,10 @@ Gemini catches real issues — see git history for proof.
 gpal/
 ├── src/gpal/
 │   ├── __init__.py       # Package metadata (__version__)
-│   ├── index.py          # Semantic search index (chromadb + Gemini embeddings)
 │   └── server.py         # MCP server + all logic
 ├── tests/
 │   ├── test_tools.py     # Unit tests (pytest)
 │   ├── test_server.py    # Integration tests (FastMCP Client, in-process)
-│   ├── test_index.py     # Index unit tests
 │   ├── test_agentic.py   # Manual: autonomous exploration
 │   ├── test_connectivity.py  # Manual: API ping
 │   └── test_switching.py     # Manual: Flash→Pro history
@@ -143,12 +142,16 @@ first, then hands off to the requested model for synthesis:
 | `"lite"` | — | Lite direct | No pipeline |
 | full model ID | — | Direct pass-through | Backward compat |
 
+**Thinking level** — controlled via `thinking` parameter (`"minimal"`, `"low"`, `"medium"`,
+`"high"`, or `None`). Pro defaults to `"high"` when `thinking` is unset. Other models default
+to no thinking unless explicitly requested.
+
 - **Lite exploration**: Lite (Haiku-class) does cheap mechanical exploration — `cat` and `ls`
   with navigation. 1M context window, AFC enabled.
 - **Flash synthesis** (role=analyst): Frontier model with tools still available to fill gaps.
 - **Pro synthesis** (role=thinker): Deep thinking enabled, tools available to fill gaps.
 - **`consult_gemini_oneshot`**: Separate stateless tool, no session. For independent questions
-  where conversation context is noise.
+  where conversation context is noise. Pro also defaults to `thinking="high"`.
 
 ### Token Tracking & Rate Limiting
 
@@ -192,6 +195,27 @@ run concurrently.
 every 5s. If the fd is invalid (client disconnected/crashed), calls `os._exit(0)`
 to prevent orphaned CPU-spinning processes. Wired via FastMCP's `lifespan=` parameter.
 
+### Batch Tools
+
+Six tools for async, discounted (~50%) Gemini batch processing. No AFC — pure
+`generate_content`. Stateless: no in-memory tracking, all status queries hit the API.
+
+| Tool | Annotations | Timeout |
+|------|-------------|---------|
+| `create_batch(queries, model, temperature)` | openWorld | 120s |
+| `get_batch(name)` | readOnly, openWorld | 30s |
+| `list_batches(limit=20)` | readOnly, openWorld | 30s |
+| `get_batch_results(name)` | readOnly, openWorld | 60s |
+| `cancel_batch(name)` | destructive, openWorld | 30s |
+| `delete_batch(name)` | destructive, idempotent, openWorld | 30s |
+
+- `queries` items: `{custom_id: str, prompt: str}` — `custom_id` stored in `InlinedRequest.metadata`
+- System prompt: `_compose_instruction(_SYSTEM_AGENT)` — user config layers included automatically
+- Results: `job.dest.inlined_responses` (fetched by re-calling `get()`)
+- `cancel()` returns `None` — must call `get()` for final state
+- State helpers: `types.JOB_STATES_SUCCEEDED`, `types.JOB_STATES_ENDED`
+- `async for job in await client.aio.batches.list()` — note the `await` before iteration
+
 ### Safety Limits
 
 | Constant | Value | Purpose |
@@ -203,35 +227,24 @@ to prevent orphaned CPU-spinning processes. Wired via FastMCP's `lifespan=` para
 | `MAX_SEARCH_RESULTS` | 10 | Limits web search results |
 | `RESPONSE_MAX_TOOL_CALLS` | 25 | Limits autonomous tool calls per response |
 
-### Semantic Search Index (index.py)
+### FileSearch (replaces chromadb index)
 
-| Constant | Value | Purpose |
-|----------|-------|---------|
-| `CHUNK_SIZE` | 50 lines | Lines per code chunk |
-| `CHUNK_OVERLAP` | 10 lines | Overlap between chunks for context |
-| `EMBEDDING_MODEL` | `gemini-embedding-001` | Gemini embedding model |
-| `EMBEDDING_BATCH_SIZE` | 100 | Max chunks per API call |
-| `RATE_LIMIT_DELAY` | 50ms | Delay between API batches |
-| `MAX_RETRIES` | 5 | Retry attempts on transient errors |
-| `MAX_CONCURRENT_EMBEDS` | 10 | Concurrent embedding requests |
+Semantic code search uses Google's native FileSearch API instead of a local chromadb index.
+Files are uploaded to FileSearch stores, where Google handles chunking, embedding, and retrieval.
 
-**Features**:
-- **Incremental indexing**: Only re-indexes files that changed (by mtime/size)
-- **Async concurrency**: Parallel embedding requests with semaphore control
-- **Rate limiting**: Automatic retry on 429 errors with exponential backoff
-- **Dry run mode**: Count files/chunks without API calls
-- **Max files limit**: Cap indexing for testing/budget control
+**MCP tools:**
+- `create_file_store(display_name)` — create a new store
+- `upload_to_file_store(store_name, file_path)` — upload a file
+- `list_file_stores()` — list stores with stats
+- `delete_file_store(name)` — delete a store and its documents
 
-**Usage in MCP tools**:
-```python
-# rebuild_index() uses these options internally:
-result = index.rebuild(
-    force=False,      # True = full rebuild, False = incremental
-    dry_run=False,    # True = count only, no API calls
-    max_files=None,   # Limit files to index (for testing)
-)
-# Returns: {"indexed": N, "skipped": M, "removed": K}
-```
+**AFC integration:**
+- `_active_stores` set tracks known stores (lazily populated on first consult)
+- When stores exist, `Tool(file_search=FileSearch(file_search_store_names=[...]))` is added
+  to the AFC tool config automatically — Gemini searches stores during generation
+- Store management tools update `_active_stores` synchronously
+
+**Resource:** `gpal://file_stores` — store statistics (replaces `gpal://index/stats`)
 
 ## Testing
 
@@ -240,7 +253,7 @@ result = index.rebuild(
 uv sync --all-extras
 
 # Unit tests (no API key needed)
-uv run pytest tests/test_server.py tests/test_tools.py tests/test_index.py -v
+uv run pytest tests/test_server.py tests/test_tools.py -v
 
 # Manual integration tests (requires GEMINI_API_KEY)
 # ⚠️ These make live API calls and will incur Gemini API costs!

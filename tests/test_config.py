@@ -6,8 +6,9 @@ from pathlib import Path
 import pytest
 
 from gpal.server import (
-    DEFAULT_SYSTEM_INSTRUCTION,
     _build_system_instruction,
+    _compose_instruction,
+    _SYSTEM_AGENT,
     _load_config,
 )
 
@@ -55,24 +56,31 @@ class TestBuildSystemInstruction:
     """Tests for _build_system_instruction()."""
 
     def test_default_only(self):
-        """With empty config, returns just the built-in instruction."""
+        """With empty config, returns empty user layers and built-in source."""
         text, sources = _build_system_instruction({})
-        assert text == DEFAULT_SYSTEM_INSTRUCTION.strip()
-        assert sources == ["built-in"]
+        # _build_system_instruction returns only user layers; the role prompt
+        # is composed separately via _compose_instruction
+        assert text == ""
+        assert sources == ["built-in (role-specific)"]
+
+    def test_compose_instruction(self):
+        """_compose_instruction combines role prompt with user layers."""
+        full = _compose_instruction(_SYSTEM_AGENT)
+        assert "consultant AI" in full
+        assert "Look at the code first" in full
 
     def test_no_default(self, tmp_path):
-        """--no-default-prompt suppresses the built-in instruction."""
+        """--no-default-prompt suppresses the built-in source label."""
         prompt_file = tmp_path / "custom.md"
         prompt_file.write_text("Custom instruction")
         text, sources = _build_system_instruction(
             {}, cli_prompt_files=[str(prompt_file)], no_default=True
         )
         assert "Custom instruction" in text
-        assert DEFAULT_SYSTEM_INSTRUCTION.strip() not in text
-        assert "built-in" not in sources
+        assert "built-in" not in sources[0] if sources else True
 
     def test_no_default_config(self, tmp_path):
-        """include_default_prompt=false in config suppresses built-in."""
+        """include_default_prompt=false in config suppresses built-in source."""
         prompt_file = tmp_path / "custom.md"
         prompt_file.write_text("Custom instruction")
         config = {
@@ -81,10 +89,10 @@ class TestBuildSystemInstruction:
         }
         text, sources = _build_system_instruction(config)
         assert "Custom instruction" in text
-        assert DEFAULT_SYSTEM_INSTRUCTION.strip() not in text
+        assert all("built-in" not in s for s in sources)
 
     def test_composition_order(self, tmp_path):
-        """Verifies correct ordering: default, config files, inline, CLI files."""
+        """Verifies correct ordering: config files, inline, CLI files."""
         config_file = tmp_path / "config-prompt.md"
         config_file.write_text("FROM_CONFIG_FILE")
         cli_file = tmp_path / "cli-prompt.md"
@@ -98,15 +106,14 @@ class TestBuildSystemInstruction:
             config, cli_prompt_files=[str(cli_file)]
         )
 
-        # Check ordering
-        default_pos = text.index("consultant AI")
+        # User layers are ordered: config files, inline, CLI files
         config_pos = text.index("FROM_CONFIG_FILE")
         inline_pos = text.index("FROM_INLINE")
         cli_pos = text.index("FROM_CLI")
-        assert default_pos < config_pos < inline_pos < cli_pos
+        assert config_pos < inline_pos < cli_pos
 
-        # Check sources
-        assert sources[0] == "built-in"
+        # Sources: built-in label first, then user layers
+        assert sources[0] == "built-in (role-specific)"
         assert str(config_file) in sources[1]
         assert "config.toml (inline)" in sources[2]
         assert "cli-prompt" in sources[3]
@@ -115,15 +122,14 @@ class TestBuildSystemInstruction:
         """Missing prompt files are warned about but don't crash."""
         config = {"system_prompts": [str(tmp_path / "nonexistent.md")]}
         text, sources = _build_system_instruction(config)
-        # Should still have the default
-        assert text == DEFAULT_SYSTEM_INSTRUCTION.strip()
-        assert sources == ["built-in"]
+        assert text == ""
+        assert sources == ["built-in (role-specific)"]
 
     def test_fallback_when_all_suppressed(self):
-        """If no_default and no files, falls back to built-in."""
+        """If no_default and no files, returns empty layers."""
         text, sources = _build_system_instruction({}, no_default=True)
-        assert text == DEFAULT_SYSTEM_INSTRUCTION.strip()
-        assert sources == ["built-in (fallback)"]
+        assert text == ""
+        assert sources == []
 
     def test_binary_prompt_file(self, tmp_path):
         """Binary file as prompt logs warning, doesn't crash."""
@@ -131,15 +137,14 @@ class TestBuildSystemInstruction:
         binary_file.write_bytes(b"\x80\x81\x82\xff\xfe")
         config = {"system_prompts": [str(binary_file)]}
         text, sources = _build_system_instruction(config)
-        # Should fall through to default only
-        assert text == DEFAULT_SYSTEM_INSTRUCTION.strip()
+        assert text == ""
 
     def test_system_prompts_wrong_type(self):
         """String instead of list for system_prompts is handled gracefully."""
         config = {"system_prompts": "not-a-list.md"}
         text, sources = _build_system_instruction(config)
-        assert text == DEFAULT_SYSTEM_INSTRUCTION.strip()
-        assert sources == ["built-in"]
+        assert text == ""
+        assert sources == ["built-in (role-specific)"]
 
     def test_tilde_expansion(self, tmp_path, monkeypatch):
         """Tilde in paths gets expanded."""

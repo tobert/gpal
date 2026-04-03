@@ -23,13 +23,13 @@ When you ask gpal a question, Gemini doesn't just guess — it **explores your c
 |---------|-------------|
 | **Stateful sessions** | Maintains conversation history via `ctx.session_id` |
 | **Autonomous exploration** | Gemini has tools to list, read, and search files |
-| **Semantic search** | Find code by meaning using Gemini embeddings + chromadb |
+| **FileSearch** | Semantic code search via Google's native FileSearch API |
 | **Gemini 3 Series** | Supports Flash and Pro with unified auto mode |
 | **Context Caching** | Store large code contexts to reduce costs and latency |
 | **Observability** | Native OpenTelemetry support (OTLP gRPC) |
 | **Distributed Tracing** | Propagates `traceparent` from MCP requests |
 | **Multimodal** | Analyze images, audio, video, PDFs |
-| **Background Tasks** | Long-running operations (like indexing) don't block |
+| **Batch Processing** | Async discounted (~50%) Gemini batch API |
 
 **Limits:** 10MB file reads, 20MB inline media, 20 search matches max.
 
@@ -37,12 +37,12 @@ When you ask gpal a question, Gemini doesn't just guess — it **explores your c
 
 | Tool | Model | Use Case |
 |------|-------|----------|
-| `consult_gemini` | `auto` (default) | Flash explores, then Pro synthesizes — best of both |
+| `consult_gemini` | `auto` (default) | Lite explores, then Flash synthesizes |
 | `consult_gemini` | `flash` | Fast, efficient mapping and searching |
 | `consult_gemini` | `pro` | Deep reasoning, complex reviews |
 | `consult_gemini_oneshot` | `flash` / `pro` | Stateless single-shot queries, no session history |
 
-**Auto mode:** Flash autonomously explores the codebase (cheap, fast), then Pro reasons over everything Flash found. History migrates automatically between models.
+**Auto mode:** Lite autonomously explores the codebase (cheap, thorough), then Flash synthesizes over what Lite found. Use `model="pro"` for deep reasoning (Lite explores, then Pro with thinking HIGH).
 
 ### Observability & Tracing
 
@@ -66,21 +66,22 @@ Reduce costs for large projects by caching context on Google's servers:
 3.  Reference the cache name in `consult_gemini` calls via the `cached_content` parameter.
 4.  View active caches via the `gpal://caches` resource.
 
-### Semantic Search
+### FileSearch
 
-Find code by meaning, not just keywords:
+Semantic code search using Google's native FileSearch API — no local embeddings or databases:
 
 ```python
-# First, build the index (runs as a background task)
-rebuild_index("/path/to/project")
+# Create a store and upload files
+create_file_store("my-project")
+upload_to_file_store("stores/...", "src/server.py")
 
-# Then search by concept
-semantic_search("authentication logic")
+# Gemini searches stores automatically during generation
+consult_gemini("find authentication logic", model="auto")
 ```
 
-- Uses Gemini's `text-embedding-004` model + chromadb for vector search
-- Index stored at `~/.local/share/gpal/index/` (XDG compliant)
-- Respects `.gitignore`, skips binary/hidden files
+- Google handles chunking, embedding, and retrieval
+- Stores managed via `create_file_store`, `upload_to_file_store`, `list_file_stores`, `delete_file_store`
+- When stores exist, Gemini searches them automatically during `consult_gemini` calls
 
 ### Custom System Prompts
 
@@ -176,10 +177,6 @@ uv run pytest -v           # Verbose output
 ```
 
 ⚠️ **Note:** Integration tests (`test_connectivity.py`, `test_agentic.py`, `test_switching.py`) make live API calls and will incur Gemini API costs.
-
-## Known Limitations
-
-- **Nested .gitignore**: Only reads root `.gitignore`, ignores nested ones (common in monorepos).
 
 ## See Also
 

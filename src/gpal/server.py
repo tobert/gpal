@@ -30,7 +30,7 @@ from fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 from google import genai
 from google.genai import errors as genai_errors, types
-from google.genai.types import GoogleSearch, Tool, ToolCodeExecution
+from google.genai.types import FileSearch, GoogleSearch, Tool, ToolCodeExecution
 from tenacity import (
     before_sleep_log,
     retry,
@@ -297,30 +297,53 @@ def token_stats() -> dict[str, dict[str, int]]:
         return stats
 
 
+def _throttle_delay(model: str) -> float:
+    """Calculate seconds to sleep until token usage drops below 90% of limit.
+
+    Returns 0.0 if no throttling needed. Walks the window oldest-first,
+    accumulating tokens that will expire, and returns the time until enough
+    expire to drop below the threshold.
+    """
+    limit = RATE_LIMITS_TPM.get(model, 0)
+    if limit <= 0:
+        return 0.0
+    threshold = limit * 0.9
+    now = time.monotonic()
+    cutoff = now - 60.0
+    with _token_lock:
+        window = _token_windows.get(model, [])
+        total = sum(c for t, c in window if t > cutoff)
+        if total <= threshold:
+            return 0.0
+        # Walk oldest entries: each expires at (timestamp + 60s)
+        excess = total - threshold
+        for ts, count in sorted(window, key=lambda x: x[0]):
+            if ts <= cutoff:
+                continue
+            excess -= count
+            if excess <= 0:
+                # This entry's expiry brings us under threshold
+                delay = (ts + 60.0) - now + 0.1  # 100ms buffer
+                return max(delay, 0.1)
+    return 0.1  # shouldn't reach here, but don't spin
+
+
 def _sync_throttle(model: str) -> None:
     """Block if approaching rate limit. For sync code paths."""
-    limit = RATE_LIMITS_TPM.get(model, 0)
-    while limit > 0:
-        current = tokens_in_window(model)
-        if current <= limit * 0.9:
-            break
-        jitter = random.uniform(1.0, 5.0)
-        logging.warning(f"Rate limit approaching for {model}: {current}/{limit} TPM, sleeping {jitter:.1f}s")
-        time.sleep(jitter)
+    delay = _throttle_delay(model)
+    if delay > 0:
+        logging.warning(f"Rate limit approaching for {model}, sleeping {delay:.1f}s")
+        time.sleep(delay)
 
 
 async def _async_throttle(model: str, ctx: Context | None = None) -> None:
-    """Async version of rate limit throttle with re-check after sleep."""
-    limit = RATE_LIMITS_TPM.get(model, 0)
-    while limit > 0:
-        current = tokens_in_window(model)
-        if current <= limit * 0.9:
-            break
-        jitter = random.uniform(1.0, 5.0)
-        logging.warning(f"Rate limit approaching for {model}: {current}/{limit} TPM, sleeping {jitter:.1f}s")
+    """Async version of rate limit throttle."""
+    delay = _throttle_delay(model)
+    if delay > 0:
+        logging.warning(f"Rate limit approaching for {model}, sleeping {delay:.1f}s")
         if ctx:
-            await ctx.warning(f"Rate limit approaching ({current}/{limit} TPM), throttling...")
-        await asyncio.sleep(jitter)
+            await ctx.warning(f"Rate limit approaching, throttling {delay:.1f}s...")
+        await asyncio.sleep(delay)
 
 
 @dataclass
@@ -397,75 +420,47 @@ def detect_mime_type(path: str) -> str | None:
 # Base identity shared by all roles. Role-specific variants append to this.
 
 _SYSTEM_BASE = """\
-We are a cybernetic system — a human and AI models working together via \
-the Model Context Protocol (MCP). Our shared goal is holistic, high-agency \
-reasoning and analysis, usually in git repositories.
+You are Gemini, a consultant AI accessed via the Model Context Protocol (MCP).
 
-We ground every claim in code we have actually read. When uncertain, we say \
-so — we never confabulate facts, function signatures, or behavior.\
-"""
-
-_SYSTEM_TOOL_LIST = """
-We have tools:
+Tools available:
 - list_directory, read_file, search_project — explore the local codebase
 - git — read-only git operations (status, diff, log, show)
 - gemini_search — search the web via Google Search
-- semantic_search — find code by meaning using vector embeddings
 
-We use them proactively to explore and verify — we don't guess when we can \
-look it up.\
+File stores are searched automatically when available.
+Use tools proactively — don't guess when you can look it up.\
 """
 
 # Lite in auto mode — cheap, aggressive, thorough exploration
-_SYSTEM_EXPLORER = _SYSTEM_BASE + _SYSTEM_TOOL_LIST + """
+_SYSTEM_EXPLORER = _SYSTEM_BASE + """
 
-Our job in this phase is EXPLORATION. We load as much relevant context as \
-possible for a follow-up synthesis phase. The synthesis model has tools but \
-works best from context we've already loaded — our thoroughness here saves \
-it round-trips.
-
-Priorities:
-- Read files in full. Thoroughness is the priority — the more context we \
-load, the better the synthesis phase performs.
-- Include tests: read test files to understand coverage and test efficacy.
-- Start with a repo tree summary (list_directory at key levels) so the \
-synthesis phase understands the project layout.
-- Follow imports, call chains, and data flow across module boundaries.\
+Your job is exploration — loading comprehensive codebase context for a \
+synthesis model that follows. Read files in full, follow imports across \
+modules, and include tests. Thoroughness over efficiency.\
 """
 
-# Pro synthesis — deep thinking with tools available to fill gaps
-_SYSTEM_THINKER = _SYSTEM_BASE + _SYSTEM_TOOL_LIST + """
+# Pro synthesis — deep reasoning with tools available to fill gaps
+_SYSTEM_THINKER = _SYSTEM_BASE + """
 
-We are in the synthesis phase. An exploration agent has loaded extensive \
-codebase context into this conversation. We have tools available to fill \
-gaps, but most context is already present.
+An exploration agent has already loaded codebase context.
 
-We provide end-to-end analysis. In addition to answering the question directly:
-- Flag security concerns we actually see in the code (not hypothetical checklists).
-- Note technical debt, dead code, and unnecessary complexity.
-- Assess test coverage and test efficacy — are the tests actually testing \
-the right behavior? Do they catch real bugs or just exercise happy paths?
-- Be concrete: give exact file paths, line numbers, and code changes.\
+Reason deeply: trace contributing factors, weigh trade-offs, \
+explain the why before proposing the how.\
 """
 
-# Flash synthesis — frontier model with tools available to fill gaps
-_SYSTEM_ANALYST = _SYSTEM_BASE + _SYSTEM_TOOL_LIST + """
+# Flash synthesis — fast insight with tools available to fill gaps
+_SYSTEM_ANALYST = _SYSTEM_BASE + """
 
-We are in the synthesis phase. An exploration agent has loaded extensive \
-codebase context into this conversation. We have tools available to fill \
-gaps, but most context is already present.
+An exploration agent has already loaded codebase context.
 
-We bring creative insight, not just mechanical analysis. We identify patterns, \
-suggest improvements, and think beyond the literal question when it serves \
-our goals. We provide concrete, actionable answers with exact file paths \
-and code changes.\
+Synthesize: identify what matters most, surface non-obvious \
+connections, and deliver actionable conclusions. Concise over exhaustive.\
 """
 
 # Direct model calls (flash or pro with tools enabled)
-_SYSTEM_AGENT = _SYSTEM_BASE + _SYSTEM_TOOL_LIST + """
+_SYSTEM_AGENT = _SYSTEM_BASE + """
 
-We read entire files or multiple modules when needed to gather complete context.
-We flag real security concerns, technical debt, and test gaps when we spot them.\
+Look at the code first, then say what you think.\
 """
 
 # Kept as the default for _build_system_instruction and backward compat
@@ -616,8 +611,11 @@ sessions_lock = threading.Lock()
 # Note: session_locks dict is removed; locks are now bundled with sessions.
 uploaded_files: TTLCache = TTLCache(maxsize=200, ttl=3600)  # 1 hour TTL
 uploaded_files_lock = threading.Lock()
-_indexes: dict = {}  # Cache for semantic search indexes
-_indexes_lock = threading.Lock()  # Thread safety for _indexes
+# FileSearch store tracking — lazily populated on first consult
+_active_stores: set[str] = set()
+_stores_lock = threading.Lock()
+_stores_initialized = False
+_stores_last_attempt: float = 0.0  # monotonic timestamp of last failed attempt
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -660,6 +658,11 @@ def get_server_info() -> str:
             "agent_length_chars": len(_compose_instruction(_SYSTEM_AGENT)),
         },
         "token_usage": token_stats(),
+        "batch": {
+            "tools": ["create_batch", "get_batch", "list_batches", "get_batch_results", "cancel_batch", "delete_batch"],
+            "discount": "~50%",
+            "note": "No tool use in batch — inline all context in prompt",
+        },
     }
     return json.dumps(info, indent=2)
 
@@ -736,31 +739,32 @@ async def get_session_detail(session_id: str) -> str:
         }, indent=2)
 
 
-@mcp.resource("gpal://index/stats")
-def get_index_stats() -> str:
-    """Semantic index statistics (files, chunks per indexed path)."""
-    # Take snapshot under lock to avoid iteration issues
-    with _indexes_lock:
-        indexes_snapshot = list(_indexes.items())
-
-    if not indexes_snapshot:
-        return json.dumps({"message": "No indexes loaded. Use semantic_search or rebuild_index first."})
-
-    stats = {}
-    for path, index in indexes_snapshot:
-        try:
-            # Get collection stats
-            code_count = index.collection.count()
-            meta_count = index.meta_collection.count()
-            stats[path] = {
-                "chunks": code_count,
-                "files_indexed": meta_count,
-                "db_path": str(index.db_path),
+@mcp.resource("gpal://file_stores")
+def get_file_stores_info() -> str:
+    """FileSearch store statistics."""
+    try:
+        client = get_client()
+        stores = list(client.file_search_stores.list())
+        if not stores:
+            return json.dumps({"message": "No file search stores. Use create_file_store to create one."})
+        # Refresh tracking
+        with _stores_lock:
+            _active_stores.clear()
+            _active_stores.update(s.name for s in stores)
+        result = {}
+        for s in stores:
+            result[s.name] = {
+                "display_name": s.display_name,
+                "active_documents": s.active_documents_count or 0,
+                "pending_documents": s.pending_documents_count or 0,
+                "failed_documents": s.failed_documents_count or 0,
+                "size_bytes": s.size_bytes or 0,
+                "create_time": str(s.create_time) if s.create_time else None,
+                "update_time": str(s.update_time) if s.update_time else None,
             }
-        except Exception as e:
-            stats[path] = {"error": str(e)}
-
-    return json.dumps(stats, indent=2)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 @mcp.resource("gpal://caches")
@@ -929,10 +933,8 @@ def search_project(search_term: str, glob_pattern: str = "**/*") -> str:
 
             files_checked += 1
             if files_checked > MAX_SEARCH_FILES:
-                return (
-                    f"Error: Too many files match '{glob_pattern}' (>{MAX_SEARCH_FILES}). "
-                    "Use a more specific pattern, or try semantic_search for large codebases."
-                )
+                matches.append(f"... (search stopped: reached {MAX_SEARCH_FILES} file limit)")
+                break
 
             try:
                 with open(filepath, encoding="utf-8", errors="replace") as f:
@@ -1006,24 +1008,52 @@ def get_client() -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
-def get_index(root: str = "."):
-    """Get or create a semantic search index for a project root."""
-    from gpal.index import CodebaseIndex  # lazy import
-    root_path = Path(root).resolve()
-    key = str(root_path)
-    
-    with _indexes_lock:
-        if key in _indexes:
-            return _indexes[key]
-    
-    # Create outside global lock to avoid blocking other project lookups
-    # Only one thread will win the assignment race below
-    new_index = CodebaseIndex(root_path, get_client())
-    
-    with _indexes_lock:
-        if key not in _indexes:
-            _indexes[key] = new_index
-        return _indexes[key]
+def _ensure_stores_initialized() -> None:
+    """Lazily populate _active_stores on first consult.
+
+    Lists existing FileSearch stores from the API so that stores created
+    in a previous server lifetime are available for AFC. On failure,
+    retries after a 60-second cooldown to avoid blocking every request.
+    """
+    global _stores_initialized, _stores_last_attempt
+    if _stores_initialized:
+        return
+    with _stores_lock:
+        if _stores_initialized:
+            return
+        # 60-second cooldown on failures to prevent retry spam
+        now = time.monotonic()
+        if now - _stores_last_attempt < 60.0:
+            return
+        _stores_last_attempt = now
+        try:
+            client = get_client()
+            for store in client.file_search_stores.list():
+                _active_stores.add(store.name)
+            _stores_initialized = True
+        except Exception as e:
+            logging.debug(f"Deferred FileSearch initialization: {e}")
+
+
+def _build_afc_tools(include_search: bool = True) -> list:
+    """Build the AFC tool list with UrlContext and conditional FileSearch.
+
+    Args:
+        include_search: Include gemini_search (web search) in the list.
+            False for create_chat's minimal config.
+    """
+    # Note: url_context cannot be combined with Function Calling (API restriction)
+    tools: list = [list_directory, read_file, search_project, git]
+    if include_search:
+        tools.append(gemini_search)
+    # Add FileSearch if any stores are active
+    _ensure_stores_initialized()
+    with _stores_lock:
+        store_names = list(_active_stores)
+    if store_names:
+        tools.append(Tool(file_search=FileSearch(file_search_store_names=store_names)))
+    return tools
+
 
 def create_chat(
     client: genai.Client,
@@ -1035,7 +1065,7 @@ def create_chat(
     if config is None:
         config = types.GenerateContentConfig(
             temperature=0.2,
-            tools=[list_directory, read_file, search_project, git],
+            tools=_build_afc_tools(include_search=False),
             automatic_function_calling=types.AutomaticFunctionCallingConfig(
                 disable=False,
                 maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
@@ -1048,6 +1078,43 @@ def create_chat(
         history=history or [],
         config=config,
     )
+
+def _sanitize_history(history: list) -> bool:
+    """Remove trailing entries that would cause Gemini API errors.
+
+    Gemini requires history to alternate user/model and end with a model
+    response. This handles two cases:
+    1. Trailing user turn (failed prior call left it dangling)
+    2. Model response ending with function_call but no matching
+       function_response from the user — Gemini will 400 on this
+
+    Mutates `history` in place. Returns True if any entries were removed.
+    """
+    changed = False
+
+    # Strip trailing user turns
+    while history and getattr(history[-1], "role", "") == "user":
+        history.pop()
+        changed = True
+
+    # Check if last model response contains an orphaned function_call
+    # (function_call with no subsequent user function_response)
+    if history and getattr(history[-1], "role", "") == "model":
+        last = history[-1]
+        parts = getattr(last, "parts", []) or []
+        has_function_call = any(
+            getattr(p, "function_call", None) is not None for p in parts
+        )
+        if has_function_call:
+            # The function_call never got a response — drop this exchange
+            history.pop()  # orphaned model function_call
+            changed = True
+            # The preceding user turn is now dangling too
+            while history and getattr(history[-1], "role", "") == "user":
+                history.pop()
+
+    return changed
+
 
 async def get_session(
     ctx: Context,
@@ -1070,22 +1137,21 @@ async def get_session(
             ctx.set_state("model", target_model)
             return session, lock
 
-    # Use per-session lock for migration
+    # Use per-session lock for migration and history sanitization
     async with lock:
         current_model = getattr(session, "_gpal_model", None)
-        if current_model == target_model:
+        history = list(getattr(session, "_curated_history", getattr(session, "history", [])))
+
+        needs_recreate = _sanitize_history(history)
+
+        if current_model == target_model and not needs_recreate:
             return session, lock
 
-        logging.info(f"Migrating session '{session_id}': {current_model} → {target_model}")
+        logging.info(f"Recreating session '{session_id}': {current_model} → {target_model}, sanitized={needs_recreate}")
         try:
-            history = list(getattr(session, "_curated_history", getattr(session, "history", [])))
-            # Gemini API requires history to end with a model response;
-            # a failed prior call may leave a trailing user turn
-            if history and getattr(history[-1], "role", "") == "user":
-                history.pop()
             session = create_chat(client, target_model, history=history, config=config)
         except Exception as e:
-            logging.error(f"History migration failed: {e}")
+            logging.error(f"Session recreation failed: {e}")
             session = create_chat(client, target_model, config=config)
 
         session._gpal_model = target_model
@@ -1204,6 +1270,7 @@ async def _consult(
     response_schema: str | None = None,
     cached_content: str | None = None,
     role: str = "agent",
+    thinking: str | None = None,
 ) -> str | ToolResult:
     """Send a query to Gemini with codebase context."""
     t0 = time.monotonic()
@@ -1249,7 +1316,7 @@ async def _consult(
         role_prompt = _role_prompts.get(role, _SYSTEM_AGENT)
         config_kwargs: dict[str, Any] = {
             "temperature": 0.2,
-            "tools": [list_directory, read_file, search_project, gemini_search, semantic_search, git],
+            "tools": _build_afc_tools(include_search=True),
             "automatic_function_calling": types.AutomaticFunctionCallingConfig(
                 disable=False,
                 maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
@@ -1258,9 +1325,16 @@ async def _consult(
             "http_options": _NO_SDK_RETRY,
         }
 
-        # Enable deep thinking for Pro synthesis
-        if role == "thinker":
-            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="HIGH")
+        # Thinking level: explicit parameter > role-based default (HIGH for thinker)
+        _thinking = thinking
+        if _thinking is None and role == "thinker":
+            _thinking = "high"
+        if _thinking is not None:
+            _level_map = {"minimal": "MINIMAL", "low": "LOW", "medium": "MEDIUM", "high": "HIGH"}
+            sdk_level = _level_map.get(_thinking.lower())
+            if not sdk_level:
+                return f"Error: Invalid thinking level '{_thinking}'. Must be one of: minimal, low, medium, high."
+            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=sdk_level)
 
         if json_mode:
             config_kwargs["response_mime_type"] = "application/json"
@@ -1366,9 +1440,7 @@ async def _consult(
                     logging.warning(f"Session '{session_id}' has stale client, recreating...")
                     try:
                         prev_history = list(getattr(session, "_curated_history", getattr(session, "history", [])))
-                        # Sanitize: Gemini API requires history to end with model response
-                        if prev_history and getattr(prev_history[-1], "role", "") == "user":
-                            prev_history.pop()
+                        _sanitize_history(prev_history)
                         new_client = get_client()
                         target_model = MODEL_ALIASES.get(model_alias.lower(), model_alias)
                         session = create_chat(new_client, target_model, history=prev_history, config=gen_config)
@@ -1466,27 +1538,23 @@ from context we've already loaded — our thoroughness here saves it round-trips
 TASK: {query}
 
 STRATEGY:
-- We start with `semantic_search` to find conceptual entry points.
-- We use `list_directory` and `search_project` for specific definitions and patterns.
-- **We always read files in full.** We have a massive context window. Complete \
-source files enable holistic observations that snippets miss.
-- We read related files too: tests, configs, type definitions, imports. We cast \
-a wide net — the more context we load, the better the synthesis phase performs.
-- We follow imports, call chains, and data flow — that's navigation, not analysis. \
-We follow the thread wherever it leads.
-- We use `git` to check recent changes, blame, or history when provenance matters.
+- Start with `search_project` to find entry points, then `list_directory` to map structure.
+- **Read files in full.** Complete source files enable holistic observations that snippets miss.
+- Read related files: tests, configs, type definitions, imports. Cast a wide net.
+- Follow imports, call chains, and data flow wherever they lead.
+- Use `git` to check recent changes, blame, or history when provenance matters.
 
 WE DO NOT:
 - Propose fixes, write code, or provide recommendations in this phase.
 - Stop until we have a clear picture of the task's "surface area."
 - Skip files to save tokens — thoroughness is the priority.
 
-OUTPUT — Structured Inventory:
+OUTPUT — Structured Inventory (the synthesis model reads this summary AND the \
+full file contents loaded into conversation history):
 1. **Key Modules**: File paths with brief roles and important line numbers.
 2. **Data Flow**: How data moves through the components found.
 3. **Patterns & Constants**: Architectural patterns, config values, shared conventions.
-4. **Files Read in Full**: List every file read completely (critical — the synthesis \
-phase relies on this context being present in the conversation).
+4. **Files Read in Full**: List every file read completely.
 5. **Blind Spots**: Files referenced but not found, unclear ownership, anything unresolved.
 """
 
@@ -1496,22 +1564,21 @@ context into this conversation. We have tools available to fill gaps, but most \
 context is already present.
 
 CONTEXT:
-The conversation history above contains complete file contents, search results, and \
-directory listings from a thorough exploration agent. We have full source files to \
-work with — let's leverage the complete context for holistic analysis.
+The conversation history contains complete file contents, search results, and \
+directory listings from a thorough exploration agent.
 
 TASK: {query}
 
 APPROACH:
-1. **Analysis**: We use the loaded source code to explain *why* the code is \
-structured this way. We identify the specific logic relevant to the task.
-2. **Solution Design**: We propose a concrete, step-by-step plan.
-3. **Implementation**: We provide exact code changes with file paths, with enough \
-surrounding context (or full function rewrites) so changes can be applied unambiguously.
-4. **Gaps**: If the exploration missed something critical, we use our tools to fill \
-it rather than leaving it unresolved.
+1. **Analysis**: Use the loaded source code to explain *why* things are the way \
+they are. Identify the specific logic relevant to the task.
+2. **Response**: Match the form to the question — explain if asked to explain, \
+propose changes if asked to change, review if asked to review.
+3. **Gaps**: If the exploration missed something critical, use our tools to fill it.
+4. **Specificity**: When proposing code changes, include exact file paths and enough \
+surrounding context so changes can be applied unambiguously.
 
-GOAL: A complete, actionable response we can apply immediately.
+GOAL: A complete, actionable response grounded in the code we've read.
 """
 
 
@@ -1525,6 +1592,7 @@ async def consult_gemini(
     json_mode: Annotated[bool, Field(default=False, description="Return structured JSON output")] = False,
     response_schema: Annotated[str | None, Field(default=None, description="JSON schema string for structured output")] = None,
     cached_content: Annotated[str | None, Field(default=None, description="Gemini context cache name")] = None,
+    thinking: Annotated[str | None, Field(default=None, description='Thinking level: "minimal", "low", "medium", "high", or None. Pro defaults to "high"')] = None,
     ctx: Context | None = None,
 ) -> str | ToolResult:
     """Consults Gemini for codebase analysis.
@@ -1539,7 +1607,7 @@ async def consult_gemini(
     elif model in ("flash", "pro"):
         synth_model = model
     elif model == "lite":
-        # Direct pass-through, no explore phase
+        # Direct pass-through, no explore phase (Lite doesn't support thinking)
         return await _consult(
             query, ctx, "lite", file_paths,
             media_paths, file_uris, json_mode, response_schema, cached_content
@@ -1548,7 +1616,8 @@ async def consult_gemini(
         # Full model ID → direct pass-through
         return await _consult(
             query, ctx, model, file_paths,
-            media_paths, file_uris, json_mode, response_schema, cached_content
+            media_paths, file_uris, json_mode, response_schema, cached_content,
+            thinking=thinking
         )
 
     # Phase 1: Lite explores (aggressive tool use, loads full file contents)
@@ -1574,7 +1643,7 @@ async def consult_gemini(
     return await _consult(
         synthesis_query, ctx, synth_model, None,
         None, None, json_mode, response_schema, cached_content,
-        role=synth_role
+        role=synth_role, thinking=thinking
     )
 
 
@@ -1587,6 +1656,7 @@ async def consult_gemini_oneshot(
     file_uris: Annotated[list[str] | None, Field(default=None, description="Gemini File API URIs (from upload_file). Use for large files that exceed inline limits")] = None,
     json_mode: Annotated[bool, Field(default=False, description="Return structured JSON output")] = False,
     response_schema: Annotated[str | None, Field(default=None, description="JSON schema string for structured output")] = None,
+    thinking: Annotated[str | None, Field(default=None, description='Thinking level: "minimal", "low", "medium", "high", or None. Pro defaults to "high"')] = None,
     ctx: Context | None = None,
 ) -> str | ToolResult:
     """Stateless single-shot Gemini query with no session history.
@@ -1662,7 +1732,7 @@ async def consult_gemini_oneshot(
         # Build config
         config_kwargs: dict[str, Any] = {
             "temperature": 0.2,
-            "tools": [list_directory, read_file, search_project, gemini_search, semantic_search, git],
+            "tools": _build_afc_tools(include_search=True),
             "automatic_function_calling": types.AutomaticFunctionCallingConfig(
                 disable=False,
                 maximum_remote_calls=RESPONSE_MAX_TOOL_CALLS,
@@ -1677,6 +1747,17 @@ async def consult_gemini_oneshot(
                     config_kwargs["response_schema"] = json.loads(response_schema)
                 except json.JSONDecodeError as e:
                     return f"Error: Invalid JSON schema: {e}"
+
+        # Thinking level: explicit parameter > model-based default (HIGH for Pro)
+        _thinking = thinking
+        if _thinking is None and resolved_model == MODEL_PRO:
+            _thinking = "high"
+        if _thinking is not None:
+            _level_map = {"minimal": "MINIMAL", "low": "LOW", "medium": "MEDIUM", "high": "HIGH"}
+            sdk_level = _level_map.get(_thinking.lower())
+            if not sdk_level:
+                return f"Error: Invalid thinking level '{_thinking}'. Must be one of: minimal, low, medium, high."
+            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=sdk_level)
 
         gen_config = types.GenerateContentConfig(**config_kwargs)
 
@@ -1756,10 +1837,13 @@ def create_context_cache(
     resolved_model = MODEL_ALIASES.get(model.lower(), model)
     
     # Caching requires stable versioned IDs, not short preview aliases
+    original_model = resolved_model
     if resolved_model in ["gemini-3-flash-preview", "gemini-2.0-flash-001"]:
-        resolved_model = "gemini-1.5-flash-001"
+        resolved_model = "gemini-2.5-flash"
     elif resolved_model in ["gemini-3-pro-preview", "gemini-3.1-pro-preview"]:
-        resolved_model = "gemini-1.5-pro-001"
+        resolved_model = "gemini-2.5-pro"
+    if original_model != resolved_model:
+        logging.info(f"Context cache: downgraded '{original_model}' to stable '{resolved_model}'")
 
     try:
         contents = [types.Part.from_uri(file_uri=uri) for uri in file_uris]
@@ -1789,67 +1873,98 @@ def delete_context_cache(
         return f"Error deleting cache: {e}"
 
 
-def semantic_search(
-    query: Annotated[str, Field(description="Natural language query to search for")],
-    limit: Annotated[int, Field(default=5, description="Maximum number of results")] = 5,
-    path: Annotated[str, Field(default=".", description="Root path of the codebase to search")] = ".",
+@mcp.tool(annotations=ToolAnnotations(openWorldHint=True))
+def create_file_store(
+    display_name: Annotated[str, Field(description="Display name for the store")],
 ) -> str:
-    """Find code semantically related to the query using vector embeddings."""
-    err = _validate_input_path(path)
-    if err:
-        return err
-    in_afc = getattr(_afc_local, "in_afc", False)
-    if in_afc:
-        _afc_api_semaphore.acquire()
+    """Create a new FileSearch store for semantic code search.
+
+    Upload files to the store with upload_to_file_store. Once populated,
+    Gemini will automatically search the store during consult_gemini calls."""
+    client = get_client()
     try:
-        index = get_index(path)
-        results = index.search(query, limit)
-        if not results:
-            return "No matches found. Try rebuilding the index."
-        output = []
-        for r in results:
-            output.append(f"**{r['file']}:{r['lines']}** (score: {r['score']})\n```\n{r['snippet']}\n```\n")
-        return "\n".join(output)
+        store = client.file_search_stores.create(
+            config=types.CreateFileSearchStoreConfig(display_name=display_name)
+        )
+        with _stores_lock:
+            _active_stores.add(store.name)
+        return f"Store created: {store.name} (display_name: {store.display_name})"
     except Exception as e:
         return f"Error: {e}"
-    finally:
-        if in_afc:
-            _afc_api_semaphore.release()
-
-mcp.tool(semantic_search)
 
 
-@mcp.tool(timeout=300, annotations=ToolAnnotations(openWorldHint=True))
-async def rebuild_index(
-    path: Annotated[str, Field(default=".", description="Root path of the codebase to index")] = ".",
-    ctx: Context | None = None,
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+def list_file_stores() -> str:
+    """List all FileSearch stores with document counts and sizes."""
+    client = get_client()
+    try:
+        stores = list(client.file_search_stores.list())
+        if not stores:
+            return "No file search stores found."
+        lines = []
+        for s in stores:
+            lines.append(
+                f"- {s.name} ({s.display_name}): "
+                f"{s.active_documents_count or 0} active, "
+                f"{s.pending_documents_count or 0} pending, "
+                f"{s.size_bytes or 0} bytes"
+            )
+        # Refresh active stores tracking
+        with _stores_lock:
+            _active_stores.clear()
+            _active_stores.update(s.name for s in stores)
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, openWorldHint=True))
+def delete_file_store(
+    name: Annotated[str, Field(description="Store resource name (e.g. 'fileSearchStores/xxx')")],
 ) -> str:
-    """Rebuild the semantic search index for a codebase."""
-    err = _validate_input_path(path)
+    """Delete a FileSearch store and all its documents."""
+    client = get_client()
+    try:
+        client.file_search_stores.delete(name=name)
+        with _stores_lock:
+            _active_stores.discard(name)
+        return f"Store '{name}' deleted."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool(annotations=ToolAnnotations(openWorldHint=True))
+def upload_to_file_store(
+    store_name: Annotated[str, Field(description="Store resource name (from create_file_store)")],
+    file_path: Annotated[str, Field(description="Path to the local file to upload")],
+    display_name: Annotated[str | None, Field(default=None, description="Display name for the file in the store")] = None,
+) -> str:
+    """Upload a file to a FileSearch store for semantic search.
+
+    Supported: text, code, PDF, and other document formats.
+    Files are chunked and embedded by Google for retrieval."""
+    err = _validate_input_path(file_path)
     if err:
         return err
+    client = get_client()
+    path = Path(file_path)
+    if not path.exists():
+        return f"Error: File '{file_path}' does not exist."
     try:
-        if ctx:
-            await ctx.info(f"Rebuilding semantic index for {path}")
-
-        index = get_index(path)
-
-        # Create progress callback that uses MCP Context
-        async def progress_callback(message: str, current: int = 0, total: int = 0) -> None:
-            if ctx:
-                await ctx.info(f"[Index] {message}")
-                if total > 0:
-                    await ctx.report_progress(progress=current, total=total)
-
-        result = await index.rebuild_async(progress_callback=progress_callback)
-
-        if ctx:
-            await ctx.info(f"Index complete: {result.get('indexed', 0)} indexed, {result.get('skipped', 0)} skipped")
-
-        return f"Index rebuilt: {result.get('indexed', 0)} indexed, {result.get('skipped', 0)} unchanged."
+        config = None
+        if display_name:
+            config = types.UploadToFileSearchStoreConfig(display_name=display_name)
+        result = client.file_search_stores.upload_to_file_search_store(
+            file_search_store_name=store_name,
+            file=str(path),
+            config=config,
+        )
+        op_name = getattr(result, "name", None)
+        doc_name = getattr(getattr(result, "response", None), "document_name", None)
+        if op_name and not doc_name:
+            return f"Upload initiated for '{path.name}' to {store_name}. Operation: {op_name} (indexing in progress — search may not work immediately)"
+        return f"Uploaded '{path.name}' to {store_name}: {doc_name or 'OK'}"
     except Exception as e:
-        if ctx:
-            await ctx.error(f"Index rebuild failed: {e}")
         return f"Error: {e}"
 
 
@@ -2054,6 +2169,214 @@ def generate_speech(
         return f"Error: No audio content generated. Finish reason: {finish_reason}"
     except Exception as e:
         return f"Error: {e}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@mcp.tool(timeout=120, annotations=ToolAnnotations(openWorldHint=True))
+async def create_batch(
+    queries: list[dict[str, str]],
+    model: str = "flash",
+    temperature: float = 0.2,
+) -> dict[str, Any]:
+    """Submit a batch of queries for async processing (~50% cost discount).
+
+    Batches run asynchronously (up to 24h). No tool use — inline all relevant
+    context in each prompt. Use get_batch/list_batches to check status and
+    get_batch_results when the job completes.
+
+    The system prompt follows the same configuration as consult_gemini
+    (config.toml, --system-prompt CLI flags).
+
+    Args:
+        queries: List of {custom_id: str, prompt: str} dicts.
+        model: Model alias or ID (default: "flash"). "pro" enables deep thinking.
+        temperature: Sampling temperature (default: 0.2).
+    """
+    try:
+        client = get_client()
+        model_id = MODEL_ALIASES.get(model.lower(), model)
+        system = _compose_instruction(_SYSTEM_AGENT)
+
+        requests = []
+        for item in queries:
+            custom_id = item.get("custom_id", "")
+            prompt = item.get("prompt", "")
+            if not custom_id or not prompt:
+                return {"error": "Each query must have 'custom_id' and 'prompt' fields."}
+            config_kwargs: dict[str, Any] = {
+                "temperature": temperature,
+                "system_instruction": system,
+            }
+            if model_id == MODEL_PRO:
+                config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="HIGH")
+            requests.append(types.InlinedRequest(
+                contents=prompt,
+                metadata={"custom_id": custom_id},
+                config=types.GenerateContentConfig(**config_kwargs),
+            ))
+
+        job = await client.aio.batches.create(
+            model=model_id,
+            src=types.BatchJobSource(inlined_requests=requests),
+        )
+        return {
+            "name": job.name,
+            "state": job.state.value if job.state else None,
+            "request_count": len(requests),
+            "created_time": str(job.create_time) if job.create_time else None,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(timeout=30, annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+async def get_batch(name: str) -> dict[str, Any]:
+    """Get the status of a batch job.
+
+    Args:
+        name: Batch job name (e.g. "batches/abc") from create_batch.
+    """
+    try:
+        client = get_client()
+        job = await client.aio.batches.get(name=name)
+        result: dict[str, Any] = {
+            "name": job.name,
+            "state": job.state.value if job.state else None,
+        }
+        if job.completion_stats:
+            result["completion_stats"] = {
+                "successful": job.completion_stats.successful_count,
+                "failed": job.completion_stats.failed_count,
+                "incomplete": job.completion_stats.incomplete_count,
+            }
+        if job.create_time:
+            result["created_time"] = str(job.create_time)
+        if job.end_time:
+            result["end_time"] = str(job.end_time)
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(timeout=30, annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+async def list_batches(limit: int = 20) -> dict[str, Any]:
+    """List recent batch jobs.
+
+    Args:
+        limit: Maximum number of batches to return (default: 20, max: 100).
+    """
+    try:
+        limit = max(1, min(limit, 100))
+        client = get_client()
+        batch_list = []
+        count = 0
+        async for job in await client.aio.batches.list():
+            if count >= limit:
+                break
+            entry: dict[str, Any] = {
+                "name": job.name,
+                "state": job.state.value if job.state else None,
+            }
+            if job.completion_stats:
+                entry["completion_stats"] = {
+                    "successful": job.completion_stats.successful_count,
+                    "failed": job.completion_stats.failed_count,
+                }
+            if job.create_time:
+                entry["created_time"] = str(job.create_time)
+            batch_list.append(entry)
+            count += 1
+        return {"count": len(batch_list), "batches": batch_list}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(timeout=60, annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+async def get_batch_results(name: str) -> dict[str, Any]:
+    """Get results from a completed batch job.
+
+    Only available when state is JOB_STATE_SUCCEEDED or JOB_STATE_PARTIALLY_SUCCEEDED.
+    Results include text extracted from each response, keyed by custom_id.
+
+    Args:
+        name: Batch job name from create_batch.
+    """
+    try:
+        client = get_client()
+        job = await client.aio.batches.get(name=name)
+        state = job.state.value if job.state else None
+        # SDK's JOB_STATES_SUCCEEDED omits PARTIALLY_SUCCEEDED — add it explicitly
+        valid_states = list(types.JOB_STATES_SUCCEEDED) + ["JOB_STATE_PARTIALLY_SUCCEEDED"]
+        if state not in valid_states:
+            return {"error": f"Batch not complete (state: {state}). Use get_batch to check status."}
+
+        results = []
+        # job.dest can be None if the job failed early before producing any output
+        inlined_responses = (job.dest.inlined_responses or []) if job.dest else []
+        for resp in inlined_responses:
+            custom_id = (resp.metadata or {}).get("custom_id", "")
+            item: dict[str, Any] = {"custom_id": custom_id}
+            if resp.error:
+                item["status"] = "error"
+                item["error"] = str(resp.error)
+            elif resp.response:
+                item["status"] = "succeeded"
+                item["text"] = resp.response.text or ""
+                usage = resp.response.usage_metadata
+                if usage:
+                    item["usage"] = {
+                        "prompt_tokens": usage.prompt_token_count,
+                        "completion_tokens": usage.candidates_token_count,
+                        "total_tokens": usage.total_token_count,
+                    }
+            results.append(item)
+        return {"count": len(results), "results": results}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(timeout=30, annotations=ToolAnnotations(destructiveHint=True, openWorldHint=True))
+async def cancel_batch(name: str) -> dict[str, Any]:
+    """Cancel a running batch job. Already-completed requests are unaffected.
+
+    Args:
+        name: Batch job name from create_batch.
+    """
+    try:
+        client = get_client()
+        await client.aio.batches.cancel(name=name)  # returns None
+        job = await client.aio.batches.get(name=name)
+        return {
+            "name": job.name,
+            "state": job.state.value if job.state else None,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool(timeout=30, annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True, openWorldHint=True))
+async def delete_batch(name: str) -> dict[str, Any]:
+    """Delete a batch job. Only works on ended (succeeded/failed/cancelled) jobs.
+
+    Args:
+        name: Batch job name from create_batch.
+    """
+    try:
+        client = get_client()
+        job = await client.aio.batches.get(name=name)
+        state = job.state.value if job.state else None
+        # SDK's JOB_STATES_ENDED omits PARTIALLY_SUCCEEDED — add it explicitly
+        ended_states = list(types.JOB_STATES_ENDED) + ["JOB_STATE_PARTIALLY_SUCCEEDED"]
+        if state not in ended_states:
+            return {"error": f"Cannot delete batch in state {state}. Cancel it first."}
+        await client.aio.batches.delete(name=name)
+        return {"deleted": name}
+    except Exception as e:
+        return {"error": str(e)}
+
 
 def setup_otel(endpoint: str | None = None) -> None:
     """Configure OpenTelemetry for OTLP export using standard variables."""

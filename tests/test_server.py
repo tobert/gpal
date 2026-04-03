@@ -17,10 +17,11 @@ from unittest.mock import patch
 from gpal.server import (
     mcp, _validate_input_path, _validate_output_path,
     record_tokens, tokens_in_window, token_stats, GeminiResponse,
-    _sync_throttle, _async_throttle, _KNOWN_MODELS, MODEL_SEARCH,
-    MODEL_LITE, RATE_LIMITS_TPM, _afc_local, _send_with_retry, _EXECUTOR,
+    _sync_throttle, _async_throttle, _throttle_delay, _KNOWN_MODELS,
+    MODEL_SEARCH, MODEL_LITE, RATE_LIMITS_TPM, _afc_local,
+    _send_with_retry, _EXECUTOR,
     _extract_retry_delay, _is_retriable_genai_error,
-    search_project,
+    search_project, _sanitize_history,
 )
 
 
@@ -36,11 +37,19 @@ EXPECTED_TOOLS = {
     "upload_file",
     "create_context_cache",
     "delete_context_cache",
-    "semantic_search",
-    "rebuild_index",
+    "create_file_store",
+    "list_file_stores",
+    "delete_file_store",
+    "upload_to_file_store",
     "list_models",
     "generate_image",
     "generate_speech",
+    "create_batch",
+    "get_batch",
+    "list_batches",
+    "get_batch_results",
+    "cancel_batch",
+    "delete_batch",
 }
 
 
@@ -70,11 +79,12 @@ async def test_tool_input_schemas():
         tools = await c.list_tools()
         by_name = {t.name: t for t in tools}
 
-        # consult_gemini should have 'query' required and 'model' optional
+        # consult_gemini should have 'query' required and 'model', 'thinking' optional
         schema = by_name["consult_gemini"].inputSchema
         assert "query" in schema.get("properties", {}), "consult_gemini missing 'query' param"
         assert "query" in schema.get("required", []), "consult_gemini: 'query' not required"
         assert "model" in schema.get("properties", {}), "consult_gemini missing 'model' param"
+        assert "thinking" in schema.get("properties", {}), "consult_gemini missing 'thinking' param"
 
         # consult_gemini_oneshot should have 'query' required
         schema = by_name["consult_gemini_oneshot"].inputSchema
@@ -94,7 +104,12 @@ async def test_tool_input_schemas():
 EXPECTED_TIMEOUTS = {
     "consult_gemini": 660,
     "consult_gemini_oneshot": 600,
-    "rebuild_index": 300,
+    "create_batch": 120,
+    "get_batch": 30,
+    "list_batches": 30,
+    "get_batch_results": 60,
+    "cancel_batch": 30,
+    "delete_batch": 30,
 }
 
 
@@ -325,52 +340,144 @@ def test_model_lite_in_known_models():
     assert MODEL_LITE in RATE_LIMITS_TPM
 
 
-def test_sync_throttle_no_block_under_limit():
-    """_sync_throttle returns immediately when usage is under 90%."""
+def test_throttle_delay_under_limit():
+    """_throttle_delay returns 0 when usage is under 90%."""
     from gpal.server import MODEL_FLASH
-    # tokens_in_window returns current usage; under limit should not block
-    with patch("gpal.server.tokens_in_window", return_value=0):
-        _sync_throttle(MODEL_FLASH)  # Should return immediately
+    assert _throttle_delay(MODEL_FLASH) == 0.0
 
 
-def test_sync_throttle_blocks_then_passes():
-    """_sync_throttle loops when over limit, then exits when under."""
+def test_throttle_delay_over_limit():
+    """_throttle_delay calculates exact sleep time from token window."""
+    from gpal.server import MODEL_FLASH, _token_windows, _token_lock
+    limit = RATE_LIMITS_TPM[MODEL_FLASH]
+    now = time.monotonic()
+    # Record tokens that will expire at now + 60 - make it over 90%
+    with _token_lock:
+        _token_windows[MODEL_FLASH] = [(now, limit)]  # 100% usage
+    try:
+        delay = _throttle_delay(MODEL_FLASH)
+        # Should be ~60s (tokens recorded at 'now', expire at now+60)
+        assert 55.0 < delay <= 61.0
+    finally:
+        with _token_lock:
+            _token_windows[MODEL_FLASH] = []
+
+
+def test_throttle_delay_unknown_model():
+    """_throttle_delay returns 0 for models not in RATE_LIMITS_TPM."""
+    assert _throttle_delay("some-unknown-model") == 0.0
+
+
+def test_sync_throttle_sleeps_exact():
+    """_sync_throttle sleeps for the delay from _throttle_delay."""
     from gpal.server import MODEL_FLASH
-    # First call: over limit, second call: under limit
-    with patch("gpal.server.tokens_in_window", side_effect=[4_000_000, 0]):
+    with patch("gpal.server._throttle_delay", return_value=5.0):
         with patch("gpal.server.time.sleep") as mock_sleep:
             _sync_throttle(MODEL_FLASH)
-            assert mock_sleep.call_count == 1
-            # Jitter should be between 1.0 and 5.0
-            slept = mock_sleep.call_args[0][0]
-            assert 1.0 <= slept <= 5.0
+            mock_sleep.assert_called_once_with(5.0)
 
 
-def test_sync_throttle_no_limit_model():
-    """_sync_throttle is a no-op for models not in RATE_LIMITS_TPM."""
-    _sync_throttle("some-unknown-model")  # Should return immediately
+def test_sync_throttle_no_sleep_when_clear():
+    """_sync_throttle doesn't sleep when _throttle_delay returns 0."""
+    from gpal.server import MODEL_FLASH
+    with patch("gpal.server._throttle_delay", return_value=0.0):
+        with patch("gpal.server.time.sleep") as mock_sleep:
+            _sync_throttle(MODEL_FLASH)
+            mock_sleep.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_async_throttle_no_block_under_limit():
-    """_async_throttle returns immediately when under limit."""
+async def test_async_throttle_sleeps_exact():
+    """_async_throttle sleeps for the delay from _throttle_delay."""
     from gpal.server import MODEL_FLASH
-    with patch("gpal.server.tokens_in_window", return_value=0):
-        await _async_throttle(MODEL_FLASH)
-
-
-@pytest.mark.asyncio
-async def test_async_throttle_blocks_then_passes():
-    """_async_throttle loops when over limit, then exits."""
-    from gpal.server import MODEL_FLASH
-    with patch("gpal.server.tokens_in_window", side_effect=[4_000_000, 0]):
+    with patch("gpal.server._throttle_delay", return_value=5.0):
         with patch("gpal.server.asyncio.sleep") as mock_sleep:
             await _async_throttle(MODEL_FLASH)
-            assert mock_sleep.call_count == 1
+            mock_sleep.assert_called_once_with(5.0)
+
+
+@pytest.mark.asyncio
+async def test_async_throttle_no_sleep_when_clear():
+    """_async_throttle doesn't sleep when _throttle_delay returns 0."""
+    from gpal.server import MODEL_FLASH
+    with patch("gpal.server._throttle_delay", return_value=0.0):
+        with patch("gpal.server.asyncio.sleep") as mock_sleep:
+            await _async_throttle(MODEL_FLASH)
+            mock_sleep.assert_not_called()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# J. AFC Context Flag
+# J. History Sanitization
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _FakeContent:
+    """Minimal stand-in for a Gemini history entry."""
+    def __init__(self, role, parts=None):
+        self.role = role
+        self.parts = parts or []
+
+
+class _FakePart:
+    """Minimal stand-in for a Gemini content part."""
+    def __init__(self, function_call=None):
+        self.function_call = function_call
+
+
+def test_sanitize_history_clean():
+    """No-op when history is already valid (ends with model, no orphans)."""
+    history = [_FakeContent("user"), _FakeContent("model")]
+    assert _sanitize_history(history) is False
+    assert len(history) == 2
+
+
+def test_sanitize_history_trailing_user():
+    """Strips trailing user turn."""
+    history = [_FakeContent("user"), _FakeContent("model"), _FakeContent("user")]
+    assert _sanitize_history(history) is True
+    assert len(history) == 2
+    assert history[-1].role == "model"
+
+
+def test_sanitize_history_orphaned_function_call():
+    """Strips model response with function_call that has no function_response."""
+    fc_part = _FakePart(function_call={"name": "read_file", "args": {}})
+    history = [
+        _FakeContent("user"),
+        _FakeContent("model"),
+        _FakeContent("user"),
+        _FakeContent("model", parts=[fc_part]),  # orphaned function_call
+    ]
+    assert _sanitize_history(history) is True
+    # Should drop the orphaned model turn and its preceding user turn
+    assert len(history) == 2
+    assert history[-1].role == "model"
+
+
+def test_sanitize_history_empty():
+    """No-op on empty history."""
+    history = []
+    assert _sanitize_history(history) is False
+    assert len(history) == 0
+
+
+def test_sanitize_history_user_then_orphaned_fc():
+    """Handles trailing user + orphaned function_call in sequence."""
+    fc_part = _FakePart(function_call={"name": "search", "args": {}})
+    history = [
+        _FakeContent("user"),
+        _FakeContent("model"),
+        _FakeContent("user"),
+        _FakeContent("model", parts=[fc_part]),
+        _FakeContent("user"),  # trailing user turn
+    ]
+    assert _sanitize_history(history) is True
+    # Strips trailing user, then finds orphaned fc, strips that + its user
+    assert len(history) == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# K. AFC Context Flag
 # ─────────────────────────────────────────────────────────────────────────────
 
 
