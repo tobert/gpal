@@ -1602,7 +1602,9 @@ async def consult_gemini(
     Just describe what we need. Use file_paths only when specific files
     must be included.
 
-    Pipeline: Lite explores quickly first, then our selected model synthesizes.
+    Pipeline: For auto, flash, and pro, Lite explores quickly first, then
+    our selected model synthesizes. "lite" and explicit model IDs skip
+    the exploration phase and query directly.
     Gemini's tools: list_directory, read_file, search_project."""
     if ctx:
         await ctx.debug(f"consult_gemini: model={model}, session={ctx.session_id}, files={len(file_paths or [])}")
