@@ -1664,6 +1664,7 @@ async def consult_gemini_oneshot(
     file_uris: Annotated[list[str] | None, Field(default=None, description="Gemini File API URIs (from upload_file). Use for large files that exceed inline limits")] = None,
     json_mode: Annotated[bool, Field(default=False, description="Return structured JSON output")] = False,
     response_schema: Annotated[str | None, Field(default=None, description="JSON schema string for structured output")] = None,
+    cached_content: Annotated[str | None, Field(default=None, description="Gemini context cache name")] = None,
     thinking: Annotated[str | None, Field(default=None, description='Thinking level: "minimal", "low", "medium", "high", or None. Pro defaults to "high"')] = None,
     ctx: Context | None = None,
 ) -> str | ToolResult:
@@ -1748,6 +1749,8 @@ async def consult_gemini_oneshot(
             "system_instruction": _compose_instruction(_SYSTEM_AGENT),
             "http_options": _NO_SDK_RETRY,
         }
+        if cached_content:
+            config_kwargs["cached_content"] = cached_content
         if json_mode:
             config_kwargs["response_mime_type"] = "application/json"
             if response_schema:
