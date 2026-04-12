@@ -1595,9 +1595,15 @@ async def consult_gemini(
     thinking: Annotated[str | None, Field(default=None, description='Thinking level: "minimal", "low", "medium", "high", or None. Pro defaults to "high"')] = None,
     ctx: Context | None = None,
 ) -> str | ToolResult:
-    """Consults Gemini for codebase analysis.
+    """Consult Gemini for codebase analysis.
 
-    Gemini has autonomous access to: list_directory, read_file, search_project."""
+    Gemini autonomously explores our project — reading files, listing
+    directories, and searching code — so we don't need to pre-read files.
+    Just describe what we need. Use file_paths only when specific files
+    must be included.
+
+    Pipeline: Lite explores quickly first, then our selected model synthesizes.
+    Gemini's tools: list_directory, read_file, search_project."""
     if ctx:
         await ctx.debug(f"consult_gemini: model={model}, session={ctx.session_id}, files={len(file_paths or [])}")
 
