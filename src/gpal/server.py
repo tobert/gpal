@@ -2125,6 +2125,8 @@ def generate_speech(
     err = _validate_output_path(output_path)
     if err:
         return err
+    if not output_path.lower().endswith(".wav"):
+        return "Error: output_path must end with .wav (Gemini returns raw PCM audio which we format as WAV)."
     resolved = MODEL_ALIASES.get(model.lower(), model)
     _sync_throttle(resolved)
     client = get_client()
