@@ -73,9 +73,9 @@ MODEL_SEARCH = "gemini-flash-latest"          # Auto-updates to latest stable Fl
 MODEL_CODE_EXEC = "gemini-flash-latest"
 MODEL_IMAGE = "imagen-4.0-ultra-generate-001"
 MODEL_IMAGE_FAST = "imagen-4.0-fast-generate-001"
-MODEL_IMAGE_PRO = "gemini-3-pro-image-preview"      # Gemini 3 Pro image generation
-MODEL_IMAGE_FLASH = "gemini-2.5-flash-image"       # Nano Banana Flash
-MODEL_SPEECH = "gemini-2.5-pro-preview-tts"
+MODEL_IMAGE_PRO = "nano-banana-pro-preview"         # Nano Banana Pro
+MODEL_IMAGE_FLASH = "gemini-3.1-flash-image-preview"  # Nano Banana 2
+MODEL_SPEECH = "gemini-3.1-flash-tts-preview"
 MODEL_SPEECH_FAST = "gemini-2.5-flash-preview-tts"
 
 MODEL_ALIASES: dict[str, str] = {
@@ -2075,7 +2075,7 @@ def _generate_image_nano_banana(
     raise ValueError("Nano Banana returned no candidates (possible safety filter)")
 
 
-NANO_BANANA_MODELS = {MODEL_IMAGE_PRO, MODEL_IMAGE_FLASH, "nano-banana-pro-preview"}
+NANO_BANANA_MODELS = {MODEL_IMAGE_PRO, MODEL_IMAGE_FLASH, "gemini-3-pro-image-preview", "gemini-2.5-flash-image"}
 
 
 @mcp.tool(annotations=ToolAnnotations(openWorldHint=True))

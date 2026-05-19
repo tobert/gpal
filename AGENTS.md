@@ -89,9 +89,9 @@ We always prefer the latest and most capable models available from Google.
 | `gemini-flash-latest` | — | Web search, code execution (auto-updates) |
 | `imagen-4.0-ultra-generate-001` | `imagen` | Ultra quality image generation (default) |
 | `imagen-4.0-fast-generate-001` | `imagen-fast` | Fast image generation |
-| `gemini-3-pro-image-preview` | `nano-pro` | Best quality images, text rendering, 4K |
-| `gemini-2.5-flash-image` | `nano-flash` | Fast, efficient image generation |
-| `gemini-2.5-pro-preview-tts` | `speech` | Text-to-speech synthesis (Pro quality) |
+| `nano-banana-pro-preview` | `nano-pro` | Best quality images, text rendering, 4K |
+| `gemini-3.1-flash-image-preview` | `nano-flash` | Nano Banana 2 — fast image generation |
+| `gemini-3.1-flash-tts-preview` | `speech` | Text-to-speech with expressive audio tags |
 | `gemini-2.5-flash-preview-tts` | `speech-fast` | Fast, cheaper text-to-speech |
 
 > **Note**: There is no separate "deep think" model. Gemini thinking mode is enabled via
