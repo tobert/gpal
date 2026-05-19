@@ -67,7 +67,7 @@ logging.basicConfig(
 
 # Model versions (centralized for easy updates)
 MODEL_LITE = "gemini-flash-lite-latest"       # Auto-updates to latest stable Lite
-MODEL_FLASH = "gemini-3-flash-preview"
+MODEL_FLASH = "gemini-3.5-flash"
 MODEL_PRO = "gemini-3.1-pro-preview"
 MODEL_SEARCH = "gemini-flash-latest"          # Auto-updates to latest stable Flash
 MODEL_CODE_EXEC = "gemini-flash-latest"
@@ -1846,15 +1846,6 @@ def create_context_cache(
     Model must be an explicit version (e.g., gemini-1.5-flash-001) or a supported alias."""
     client = get_client()
     resolved_model = MODEL_ALIASES.get(model.lower(), model)
-    
-    # Caching requires stable versioned IDs, not short preview aliases
-    original_model = resolved_model
-    if resolved_model in ["gemini-3-flash-preview", "gemini-2.0-flash-001"]:
-        resolved_model = "gemini-2.5-flash"
-    elif resolved_model in ["gemini-3-pro-preview", "gemini-3.1-pro-preview"]:
-        resolved_model = "gemini-2.5-pro"
-    if original_model != resolved_model:
-        logging.info(f"Context cache: downgraded '{original_model}' to stable '{resolved_model}'")
 
     try:
         contents = [types.Part.from_uri(file_uri=uri) for uri in file_uris]
