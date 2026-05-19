@@ -1,15 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1564 632" width="1564" height="632" role="img">
-  <desc>README banner final: transparent background. Friendly four-pointed sparkle character on the left with face. 'gpal' wordmark in bold blue-purple-pink gradient on the right. Tagline 'YOUR PAL GEMINI' in mid-purple beneath the wordmark. Four tiny decorative sparkles in the corners. Works on both light and dark themes.</desc>
-  <rect width="100%" height="100%" fill="#1a1a2e" rx="8"/>
-  <text x="782" y="52" text-anchor="middle"
-        font-family="system-ui, sans-serif" font-size="16" fill="#e0e0e0" opacity="0.7">
-    gpal-banner-final
-  </text>
-  <rect x="32" y="72" width="1500" height="500"
-        fill="#16213e" rx="6"/>
-  <svg x="32" y="72" width="1500" height="500">
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1500 500">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1500 500" role="img">
+  <title>gpal — Your Pal Gemini</title>
+  <desc>Friendly four-pointed sparkle character on the left with face. 'gpal' wordmark in bold blue-purple-pink gradient on the right. Tagline 'YOUR PAL GEMINI' beneath. Transparent background.</desc>
   <defs>
     <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#5BB4FF"/>
@@ -29,9 +21,6 @@
     </filter>
   </defs>
 
-  <!-- NO background rect: fully transparent -->
-
-  <!-- Decorative sparkles, bumped to 35% opacity for dark-mode visibility -->
   <path d="M 90 68 Q 97 83 112 90 Q 97 97 90 112 Q 83 97 68 90 Q 83 83 90 68 Z" fill="url(#grad)" fill-opacity="0.35"/>
   <path d="M 1410 380 Q 1419 401 1440 410 Q 1419 419 1410 440 Q 1401 419 1380 410 Q 1401 401 1410 380 Z" fill="url(#grad)" fill-opacity="0.35"/>
   <path d="M 1380 94 Q 1385 105 1396 110 Q 1385 115 1380 126 Q 1375 115 1364 110 Q 1375 105 1380 94 Z" fill="url(#grad)" fill-opacity="0.35"/>
@@ -42,8 +31,7 @@
     <path d="M 320 50 Q 380 190 520 250 Q 380 310 320 450 Q 260 310 120 250 Q 260 190 320 50 Z" fill="url(#gloss)" stroke="url(#gloss)" stroke-width="14" stroke-linejoin="round"/>
     <circle cx="278" cy="244" r="17" fill="#ffffff"/>
     <circle cx="362" cy="244" r="17" fill="#ffffff"/>
-    <path d="M 291 274 Q 320 286 349 274"
-          fill="none" stroke="#ffffff" stroke-width="11" stroke-linecap="round"/>
+    <path d="M 291 274 Q 320 286 349 274" fill="none" stroke="#ffffff" stroke-width="11" stroke-linecap="round"/>
   </g>
 
   <text x="580" y="305"
@@ -56,17 +44,10 @@
         stroke-linejoin="round"
         letter-spacing="-6">gpal</text>
 
-  <!-- Tagline color bumped to mid-purple for dark/light mode readability -->
   <text x="584" y="410"
         font-family="'Helvetica Neue', 'DejaVu Sans', Helvetica, Arial, sans-serif"
         font-size="34"
         font-weight="600"
         fill="#9080C0"
         letter-spacing="4">YOUR PAL GEMINI</text>
-</svg>
-  </svg>
-  <text x="782" y="624" text-anchor="middle"
-        font-family="system-ui, sans-serif" font-size="11" fill="#e0e0e0" opacity="0.35">
-    1500×500 · Scry
-  </text>
 </svg>
